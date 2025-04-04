@@ -4,7 +4,7 @@ import dolfinx.io
 import ufl
 from dolfinx.fem.petsc import (assemble_vector, assemble_matrix)
 from dolfinx.fem import (Function, FunctionSpace, form, Constant,
-                        assemble_scalar, VectorFunctionSpace)
+                        assemble_scalar, VectorFunctionSpace, TensorFunctionSpace)
 import basix
 import scipy.sparse as sp
 import numpy as np
@@ -279,3 +279,52 @@ class RMShellPDE:
         basis_vec = sp.csr_array((c_tab, (c_tab.shape[0]*[int(x_idx)], geom_dofs)), shape=mat_shape)
 
         return basis_vec
+
+
+
+class RMShellPDECLT(RMShellPDE):
+    def __init__(self, mesh, element_wise_material=False, elementwise_pressure=False):
+        self.mesh = mesh
+        element_type = "CG2CG1"
+        #element_type = "CG2CR1"
+
+        self.element = element = ShellElement(
+                        mesh,
+                        element_type)
+        self.dx_inplane, self.dx_shear = element.dx_inplane, element.dx_shear
+
+        self.W  = self.element.W
+        self.element_wise_material = element_wise_material
+        if element_wise_material:
+            self.VABD = TensorFunctionSpace(self.mesh, ('DG', 0), shape=(3, 3))
+            self.VAs = TensorFunctionSpace(self.mesh, ('DG', 0), shape=(2, 2))
+        else:
+            self.VABD = TensorFunctionSpace(self.mesh, ('CG', 1), shape=(3, 3))
+            self.VAs = TensorFunctionSpace(self.mesh, ('CG', 1), shape=(2, 2))
+        if elementwise_pressure:
+            self.VF = VectorFunctionSpace(mesh, ("DG", 0))
+        else:
+            self.VF = VectorFunctionSpace(mesh, ("CG", 1))
+        self.VU = VectorFunctionSpace(mesh, ("CG", 1))
+        self.bf_sup_sizes = assemble_vector(
+                form(TestFunction(self.VF.sub(0).collapse()[0])*dx)).getArray()
+        # self.bf_sup_sizes = np.ones_like(self.bf_sup_sizes)
+
+    def pdeRes(self, w, uhat, f, CLT, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
+        self.elastic_model = elastic_model = ElasticModelShapeOpt(self.mesh, w, 
+                                                                  uhat, CLT)
+        elastic_energy = elastic_model.elasticEnergy(dx_inplane=self.dx_inplane, 
+                                                     dx_shear=self.dx_shear)
+        res = elastic_model.weakFormResidual(elastic_energy, f,
+                                             penalty=penalty, dss=dss, dSS=dSS, g=g)
+        return res
+    
+    def elastic_energy(self):
+        elastic_energy = self.elastic_model.elasticEnergy(dx_inplane=self.dx_inplane, 
+                                                          dx_shear=self.dx_shear)
+        return elastic_energy
+    
+    def strain(self):
+        eps = self.elastic_model.eps()
+        tau = self.elastic_model.tau()
+        return strain
