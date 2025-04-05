@@ -155,6 +155,7 @@ class RMShellModel:
 
         stress_form = shell_pde.von_Mises_stress(
                         w,uhat,h,E,nu,surface='Top')
+        projected_stress_form = shell_pde.projected_von_Mises_stress(stress_form)
         fea.add_input('thickness', h, init_val=0.001, record=self.record)
         fea.add_input('F_solid', f, init_val=1., record=self.record)
         fea.add_input('E', E, init_val=1., record=self.record)
@@ -186,6 +187,12 @@ class RMShellModel:
                         function_space=('DG',1),
                         record=self.record,
                         vtk=True)
+        fea.add_field_output(name='projected_stress',
+                        form=projected_stress_form,
+                        arguments=['thickness','disp_solid','E', 'nu','uhat'],
+                        function_space=('CG',1),
+                        record=self.record,
+                        vtk=False)
         
 
         if self.association_table is not None:
@@ -366,12 +373,24 @@ class RMShellModel:
         solid_model = FEAModel(fea=[self.fea], fea_name='rm_shell')
         shell_outputs = solid_model.evaluate(shell_inputs, debug_mode=debug_mode)
 
+        # print(shell_outputs.disp_solid.shape)
+        # print(shell_outputs.stress.shape)
+        # exit()
+        # print(len(self.shell_pde.mesh.topology.original_cell_index.tolist()))
+        # print(len(self.shell_pde.mesh.geometry.input_global_indices))
+        # exit()
+
         #:::::::::::::::::::::: Postprocess the outputs ::::::::::::::::::::::::
         disp_extraction_model = DisplacementExtractionModel(shell_pde=self.shell_pde)
         disp_extracted = disp_extraction_model.evaluate(shell_outputs.disp_solid)
         disp_extracted.add_name('disp_extracted')
         shell_outputs.disp_extracted = disp_extracted
         
+        # flip indices to match the CADDEE mesh
+        fenics_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
+        reverse_fenics_mesh_indices = np.argsort(fenics_mesh_indices).tolist()
+        shell_outputs.stress_extracted = shell_outputs.projected_stress[reverse_fenics_mesh_indices]
+
         aggregated_stress_model = AggregatedStressModel(m=self.m, rho=self.rho)
         aggregated_stress = aggregated_stress_model.evaluate(shell_outputs.pnorm_stress)
         aggregated_stress.add_name('aggregated_stress')

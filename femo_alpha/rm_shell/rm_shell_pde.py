@@ -14,7 +14,7 @@ from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import (ShellEl
                                                                     ShellStressRM,
                                                                     MaterialModel,
                                                                     ElasticModelShapeOpt)
-from femo_alpha.rm_shell.linear_shell_fenicsx.utils import computeNodalDisp
+from femo_alpha.rm_shell.linear_shell_fenicsx.utils import computeNodalDisp, project
 from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import J
 
 
