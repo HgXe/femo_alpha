@@ -426,6 +426,7 @@ class RMShellModelCLT(RMShellModel):
         B = Function(shell_pde.VABD)
         D = Function(shell_pde.VABD)
         As = Function(shell_pde.VAs)
+        dir = Function(shell_pde.dir)
         density = Function(shell_pde.VT)
         h = Function(shell_pde.VT)
         uhat = Function(shell_pde.VU)
@@ -457,6 +458,7 @@ class RMShellModelCLT(RMShellModel):
                                          uhat=uhat,      # mesh displacement
                                          f=f,            # force
                                          CLT=(A,B,D,As), # CLT stiffness
+                                         direction=dir,  # direction of the laminate
                                          penalty=PENALTY_BC, 
                                          dss=dss, dSS=dSS, g=g)
 
@@ -465,20 +467,22 @@ class RMShellModelCLT(RMShellModel):
         compliance_form = shell_pde.compliance(u_mid,uhat,h,f)
         mass_form = shell_pde.mass(uhat, h, density)
         elastic_energy_form = shell_pde.elastic_energy()
-        eps_form = shell_pde.eps()
+        eps_form, kappa_form, gamma_form = shell_pde.get_laminate_strains()
         dx_reduced = ufl.Measure('dx', domain=mesh, 
                                  metadata={'quadrature_degree':4})
 
         fea.add_input('thickness', h, init_val=0.001, record=self.record)
         fea.add_input('F_solid', f, init_val=1., record=self.record)
-        # fea.add_input('E', E, init_val=1., record=self.record)
-        # fea.add_input('nu', nu, init_val=1., record=self.record)
         fea.add_input('A', A,init_val=1., record=self.record)
         fea.add_input('B', B, init_val=1., record=self.record)
         fea.add_input('D', D, init_val=1., record=self.record)
         fea.add_input('As', As, init_val=1., record=self.record)
         fea.add_input('density', density, init_val=1., record=self.record)
         fea.add_input('uhat', uhat, init_val=0., record=self.record)
+
+        arguments = ['thickness','F_solid',
+                    'A','B','D','As',
+                    'density','uhat']
 
         fea.add_state(name='disp_solid',
                         function=w,
@@ -506,7 +510,8 @@ class RMShellModelCLT(RMShellModel):
                         vtk=True)
         
         fea.add_field_output(name='eps',
-                             form=strain_form,)
+                             form=eps_form,
+                             )
         
 
         if self.association_table is not None:
@@ -528,8 +533,10 @@ class RMShellModelCLT(RMShellModel):
     
     def evaluate(self, force_vector: csdl.Variable, 
                 thickness: csdl.Variable,
-                E: csdl.Variable, 
-                nu: csdl.Variable, 
+                A: csdl.Variable,
+                B: csdl.Variable,
+                D: csdl.Variable,
+                As: csdl.Variable,
                 density: csdl.Variable,
                 node_disp: csdl.Variable=None,
                 debug_mode=False,
@@ -565,9 +572,11 @@ class RMShellModelCLT(RMShellModel):
         else:
             material_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
         shell_inputs.thickness = thickness[material_mesh_indices]
-        shell_inputs.E = E[material_mesh_indices]
-        shell_inputs.nu = nu[material_mesh_indices]
         shell_inputs.density = density[material_mesh_indices]
+        shell_inputs.A = A[material_mesh_indices]
+        shell_inputs.B = B[material_mesh_indices]
+        shell_inputs.D = D[material_mesh_indices]
+        shell_inputs.As = As[material_mesh_indices]
 
         # reshape the force matrix to vector and sort indices
         if self.elementwise_pressure:
@@ -581,8 +590,8 @@ class RMShellModelCLT(RMShellModel):
         else:
             # Compute nodal pressures based on forces
             print('Converting forces to pressures ...')
-            A = self.shell_pde.construct_force_to_pressure_map()
-            pressure = csdl.solve_linear(A.toarray(), reshaped_force)
+            p_map = self.shell_pde.construct_force_to_pressure_map()
+            pressure = csdl.solve_linear(p_map.toarray(), reshaped_force)
             shell_inputs.F_solid = pressure
         shell_inputs.F_solid.add_name('F_solid')
 
@@ -602,13 +611,13 @@ class RMShellModelCLT(RMShellModel):
         reshaped_node_disp.add_name('uhat')
         shell_inputs.uhat = reshaped_node_disp
 
-        #:::::::::::::::::::::: Evaluate the model :::::::::::::::::::::::::::::
+        # :::::::::::::::::::::: Evaluate the model ::::::::::::::::::::::
         # Evaluate the shell model
         print('Evaluating the RM shell model ...')
         solid_model = FEAModel(fea=[self.fea], fea_name='rm_shell')
         shell_outputs = solid_model.evaluate(shell_inputs, debug_mode=debug_mode)
 
-        #:::::::::::::::::::::: Postprocess the outputs ::::::::::::::::::::::::
+        # :::::::::::::::::::::: Postprocess the outputs ::::::::::::::::::::::
         disp_extraction_model = DisplacementExtractionModel(shell_pde=self.shell_pde)
         disp_extracted = disp_extraction_model.evaluate(shell_outputs.disp_solid)
         disp_extracted.add_name('disp_extracted')

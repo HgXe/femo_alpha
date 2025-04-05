@@ -20,7 +20,7 @@ from ufl import (VectorElement, MixedElement, dx, indices, as_tensor, as_vector,
                     Jacobian, as_matrix, inv)
 
 from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import (J, F, gradx, voigt2D, 
-                    gradv_local, global_to_local_inplane, local_basis_inplane,)
+                    gradv_local, global_to_local_inplane, local_basis_inplane, compute_laminate_transformations)
 from femo_alpha.rm_shell.linear_shell_fenicsx.utils import project
 
 class ShellElement():
@@ -196,7 +196,7 @@ class ElasticModelShapeOpt(object):
     energy based on the given mesh, function space, and the material properties.
     '''
 
-    def __init__(self,mesh, w, uhat, clt_matrices, shl_offset=None):
+    def __init__(self,mesh, w, uhat, clt_matrices, direciton, shl_offset=None):
         self.mesh = mesh
         self.w = w
         self.u_mid, self.theta = split(self.w)
@@ -215,6 +215,9 @@ class ElasticModelShapeOpt(object):
         # E01[i,j] is the j-th component of the i-th basis vector:
         self.E01 = global_to_local_inplane(E0,E1)
 
+        # Transformations for laminate coordinates
+        self.local2lam, self.lam2local, self.local2lam_s, self.lam2local_s = compute_laminate_transformations(E0, direciton)
+
         ####### Compute the integrator and differentiator based on the mesh deformation #######
         self.uhat = uhat
         self.gradu = gradx(self.u_mid, self.uhat)
@@ -224,10 +227,14 @@ class ElasticModelShapeOpt(object):
         self.isotropic = True
         if isinstance(self.A, dolfinx.fem.function.Function):
             self.isotropic = False
+        self.direciton = direciton
         self.kappa = self.local_bending_curvature()
         self.eps = self.local_membrane_strains()
         self.gamma = self.local_shear_strains()
         self.N, self.M, self.Q = self.computeStresses()
+        self.eps_lam = self.local2lam*voigt2D(self.eps)
+        self.kappa_lam = self.local2lam*voigt2D(self.kappa)
+        self.gamma_lam = self.local2lam_s*self.gamma
 
     def local_membrane_strains(self, offset=None):
 
@@ -264,12 +271,13 @@ class ElasticModelShapeOpt(object):
         local strains.
         '''
 
+        local2lam, lam2local = self.local2lam, self.lam2local
         # membrane stresses
-        N = self.A*voigt2D(self.eps) + self.B*voigt2D(self.kappa)
+        N = lam2local*self.A*local2lam*voigt2D(self.eps) + lam2local*self.B*local2lam*voigt2D(self.kappa)
         # bending moments
-        M = self.B*voigt2D(self.eps) + self.D*voigt2D(self.kappa)
+        M = lam2local*self.B*local2lam*voigt2D(self.eps) + lam2local*self.D*local2lam*voigt2D(self.kappa)
         # out-of-plane shear stresses
-        Q = self.A_s*self.gamma
+        Q = self.lam2local_s*self.A_s*self.local2lam_s*self.gamma
         return N, M, Q
 
     def shearEnergy(self, dx_shear):

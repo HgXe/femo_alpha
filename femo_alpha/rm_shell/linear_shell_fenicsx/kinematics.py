@@ -81,6 +81,36 @@ def global_to_local_inplane(E0,E1):
 
     return T                 
 
+def compute_laminate_transformations(E0, d):
+        '''
+        Compute transformation matrix for in-plain stress/strain components
+        from the local to the laminate coordinate system.
+        '''
+
+        # make sure d is a unit vector
+        d = unit(d)
+
+        c = dot(E0, d)
+        s = sqrt(1 - c**2)
+
+        local2lam = as_matrix([[c**2,  s**2,  2*c*s],
+                               [s**2,  c**2, -2*c*s],
+                               [-c*s,  c*s,   c**2-s**2]])
+        
+        lam2local = as_matrix([[c**2,  s**2, -2*c*s],
+                               [s**2,  c**2,  2*c*s],
+                               [c*s,  -c*s,   c**2-s**2]])
+
+        local2lam_s = as_matrix([[c, -s],
+                                 [s,  c]])
+        
+        lam2local_s = as_matrix([[c,  s],
+                                 [-s, c]])
+
+
+        return local2lam, lam2local, local2lam_s, lam2local_s
+
+
 def gradv_local(gradv_global,T):
 
     '''

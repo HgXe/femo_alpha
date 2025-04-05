@@ -298,9 +298,11 @@ class RMShellPDECLT(RMShellPDE):
         if element_wise_material:
             self.VABD = TensorFunctionSpace(self.mesh, ('DG', 0), shape=(3, 3))
             self.VAs = TensorFunctionSpace(self.mesh, ('DG', 0), shape=(2, 2))
+            self.dir = VectorFunctionSpace(mesh, ("DG", 0))
         else:
             self.VABD = TensorFunctionSpace(self.mesh, ('CG', 1), shape=(3, 3))
             self.VAs = TensorFunctionSpace(self.mesh, ('CG', 1), shape=(2, 2))
+            self.dir = VectorFunctionSpace(mesh, ("CG", 1))
         if elementwise_pressure:
             self.VF = VectorFunctionSpace(mesh, ("DG", 0))
         else:
@@ -310,9 +312,9 @@ class RMShellPDECLT(RMShellPDE):
                 form(TestFunction(self.VF.sub(0).collapse()[0])*dx)).getArray()
         # self.bf_sup_sizes = np.ones_like(self.bf_sup_sizes)
 
-    def pdeRes(self, w, uhat, f, CLT, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
+    def pdeRes(self, w, uhat, f, CLT, direction, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
         self.elastic_model = elastic_model = ElasticModelShapeOpt(self.mesh, w, 
-                                                                  uhat, CLT)
+                                                                  uhat, CLT, direction)
         elastic_energy = elastic_model.elasticEnergy(dx_inplane=self.dx_inplane, 
                                                      dx_shear=self.dx_shear)
         res = elastic_model.weakFormResidual(elastic_energy, f,
@@ -324,7 +326,14 @@ class RMShellPDECLT(RMShellPDE):
                                                           dx_shear=self.dx_shear)
         return elastic_energy
     
-    def strain(self):
-        eps = self.elastic_model.eps()
-        tau = self.elastic_model.tau()
-        return strain
+    def get_laminate_strains(self):
+        eps = self.elastic_model.eps_lam
+        kappa = self.elastic_model.kappa_lam
+        gamma = self.elastic_model.gamma_lam
+        return eps, kappa, gamma
+
+    
+    # def strain(self):
+    #     eps = self.elastic_model.eps()
+    #     tau = self.elastic_model.tau()
+    #     return strain

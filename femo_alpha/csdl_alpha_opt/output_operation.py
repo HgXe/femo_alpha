@@ -110,7 +110,7 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
         output.add_name(self.output_name)
 
         # declare any derivative parameters
-        self.declare_derivative_parameters(self.output_name, '*', dependent=True)
+        # self.declare_derivative_parameters(self.output_name, '*', dependent=True)
         return output
 
     def compute(self, input_vals, output_vals):
@@ -127,4 +127,15 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
                 self.fea_output['function'], self.fea.opt_iter
             )
 
+    def compute_derivatives(self, input_vals, output_vals, derivatives):
+        for arg_name in input_vals:
+            arg = self.args_dict[arg_name]
+            update(arg["function"], input_vals[arg_name])
 
+        for arg_name in input_vals:
+            derivatives[self.output_name, arg_name] = assemble(
+                computePartials(
+                    self.fea_output["form"], self.args_dict[arg_name]["function"]
+                ),
+                dim=self.output_dim + 1,
+            )
