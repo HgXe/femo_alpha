@@ -14,7 +14,7 @@ from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import (ShellEl
                                                                     ShellStressRM,
                                                                     MaterialModel,
                                                                     ElasticModelShapeOpt)
-from femo_alpha.rm_shell.linear_shell_fenicsx.utils import computeNodalDisp, project
+from femo_alpha.rm_shell.linear_shell_fenicsx.utils import computeNodalDisp, project_2
 from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import J
 
 
@@ -142,20 +142,43 @@ class RMShellPDE:
         shell_stress_RM = ShellStressRM(self.mesh, w, uhat, h, E, nu)
         if surface == 'Top':
             # stress on the top surface
-            vm_stress = shell_stress_RM.vonMisesStress(h/2)
+            xi = h/2
         elif surface == 'Mid':
             # stress on the mid surface
-            vm_stress = shell_stress_RM.vonMisesStress(0.)
+            xi = 0.
         elif surface == 'Bot':
             # stress on the bottom surface
-            vm_stress = shell_stress_RM.vonMisesStress(-h/2)
+            xi = -h/2
         else:
             TypeError("Unsupported surface type for stress computation.")
-        return vm_stress
+        return shell_stress_RM.vonMisesStress(xi)
 
-    def projected_von_Mises_stress(self, vm_stress):
+    def stress_components(self,w,uhat,h,E,nu,surface='Top'):
+        shell_stress_RM = ShellStressRM(self.mesh, w, uhat, h, E, nu)
+        if surface == 'Top':
+            # stress on the top surface
+            xi = h/2
+        elif surface == 'Mid':
+            # stress on the mid surface
+            xi = 0.
+        elif surface == 'Bot':
+            # stress on the bottom surface
+            xi = -h/2
+        else:
+            TypeError("Unsupported surface type for stress computation.")
+        sigma_hat, sigma_shear = shell_stress_RM.cauchyStresses(xi)
+
+        # project to CG1
+        V1 = FunctionSpace(self.mesh, ('CG', 1))
+        stress_func = Function(V1)
+        stress_func.interpolate(sigma_hat[0])
+        # project(sigma_hat[0], stress_func, lump_mass=False)
+        return stress_func
+
+
+    def projected_von_Mises_stress(self, vm_stress:Function):
         von_Mises_func = Function(self.VT)
-        project(vm_stress, von_Mises_func, lump_mass=False)
+        project_2(vm_stress, von_Mises_func)
         return von_Mises_func
 
     def compute_nodal_disp(self,func):

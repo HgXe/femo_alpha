@@ -155,7 +155,8 @@ class RMShellModel:
 
         stress_form = shell_pde.von_Mises_stress(
                         w,uhat,h,E,nu,surface='Top')
-        projected_stress_form = shell_pde.projected_von_Mises_stress(stress_form)
+    
+        # projected_stress_form = shell_pde.projected_von_Mises_stress(stress_form)
         fea.add_input('thickness', h, init_val=0.001, record=self.record)
         fea.add_input('F_solid', f, init_val=1., record=self.record)
         fea.add_input('E', E, init_val=1., record=self.record)
@@ -188,11 +189,11 @@ class RMShellModel:
                         record=self.record,
                         vtk=True)
         fea.add_field_output(name='projected_stress',
-                        form=projected_stress_form,
+                        form=stress_form,
                         arguments=['thickness','disp_solid','E', 'nu','uhat'],
                         function_space=('CG',1),
                         record=self.record,
-                        vtk=False)
+                        vtk=True)
         
 
         if self.association_table is not None:
@@ -389,7 +390,7 @@ class RMShellModel:
         # flip indices to match the CADDEE mesh
         fenics_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
         reverse_fenics_mesh_indices = np.argsort(fenics_mesh_indices).tolist()
-        shell_outputs.stress_extracted = shell_outputs.projected_stress[reverse_fenics_mesh_indices]
+        shell_outputs.stress_extracted = shell_outputs.stress[reverse_fenics_mesh_indices]
 
         aggregated_stress_model = AggregatedStressModel(m=self.m, rho=self.rho)
         aggregated_stress = aggregated_stress_model.evaluate(shell_outputs.pnorm_stress)

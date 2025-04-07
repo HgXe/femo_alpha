@@ -85,6 +85,54 @@ def project(v, target_func, bcs=[], lump_mass=False):
         solver.setOperators(A)
         solver.solve(b, target_func.vector)
 
+def project_2(e, target_func, bcs=[]):
+    # Liberated from dolfiny: 
+    # https://github.com/michalhabera/dolfiny/blob/202e43711c54bb5d376a6e622e0bc896a20102dd/src/dolfiny/projection.py#L8-L48
+    """Project UFL expression.
+
+    Note
+    ----
+    This method solves a linear system (using KSP defaults).
+
+    """
+
+
+    # Ensure we have a mesh and attach to measure
+    V = target_func.function_space
+    dx = ufl.dx(V.mesh)
+
+
+    # Define variational problem for projection
+    w = ufl.TestFunction(V)
+    v = ufl.TrialFunction(V)
+    a = dolfinx.fem.form(ufl.inner(v, w) * dx)
+    L = dolfinx.fem.form(ufl.inner(e, w) * dx)
+
+
+    # Assemble linear system
+    A = assemble_matrix(a, bcs)
+    A.assemble()
+    b = assemble_vector(L)
+    apply_lifting(b, [a], [bcs])
+    b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    set_bc(b, bcs)
+
+
+    # Solve linear system
+    solver = PETSc.KSP().create(A.getComm())
+    solver.setType("bcgs")
+    solver.getPC().setType("bjacobi")
+    solver.rtol = 1.0e-05
+    solver.setOperators(A)
+    solver.solve(b, target_func.vector)
+    assert solver.reason > 0
+    target_func.x.scatter_forward()
+
+
+    # Destroy PETSc linear algebra objects and solver
+    solver.destroy()
+    A.destroy()
+    b.destroy()
 
 def calculateSurfaceArea(mesh, boundary):
 
