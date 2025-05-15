@@ -9,7 +9,7 @@ constitutive model and the elastic energy in weak form.
 # from distutils.errors import DistutilsClassError
 
 import dolfinx
-from dolfinx.fem import FunctionSpace, TensorFunctionSpace, Function, Constant
+from dolfinx.fem import FunctionSpace, TensorFunctionSpace, Function, Constant, form
 from ufl import (dx, inner, dot, cross, as_matrix, Identity, sym, split,
                 CellDiameter, TestFunction, TrialFunction, derivative, inv,
                 FacetNormal, sqrt, replace, grad)
@@ -20,8 +20,10 @@ from ufl import (VectorElement, MixedElement, dx, indices, as_tensor, as_vector,
                     Jacobian, as_matrix, inv)
 
 from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import (J, F, gradx, voigt2D, 
-                    gradv_local, global_to_local_inplane, local_basis_inplane,)
+                    gradv_local, global_to_local_inplane, local_basis_inplane)
 from femo_alpha.rm_shell.linear_shell_fenicsx.utils import project
+from dolfinx.fem.petsc import assemble_matrix, assemble_vector
+from petsc4py import PETSc
 
 class ShellElement():
 
@@ -626,6 +628,23 @@ class ElasticModelModal(object):
         # retval += drilling_inertia
         return retval
 
+def custom_solve_direct(res, func, bc, report):
+    F = res
+    w = func
+    bcs = bc
+    
+    a = derivative(F, w)
+    L = -F
+    A = assemble_matrix(form(a), bcs)
+    A.assemble()
+    b = assemble_vector(form(L))
+    # b.setArray(f1.vector.getArray())
+    # b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    dolfinx.fem.set_bc(b, bcs)
+
+    ######### Solve the linear system with KSP solver ############
+    solveKSP_mumps(A, b, w.vector)
+
 # def solveNonlinear(F, w, bcs, abs_tol=1e-50, max_it=3, log=False):
 
 #     '''
@@ -677,21 +696,22 @@ class ElasticModelModal(object):
 #     history = ksp.getConvergenceHistory()
 
 
-# def solveKSP_mumps(A, b, x):
-#     '''
-#     Implementation of KSP solution of the linear system Ax=b using MUMPS
-#     '''
+def solveKSP_mumps(A, b, x):
+    '''
+    Implementation of KSP solution of the linear system Ax=b using MUMPS
+    '''
+    # A is a petsc4py.PETSc.Mat (and is sparse)
 
-#     # setup petsc for pre-only solve
-#     ksp = PETSc.KSP().create(A.getComm())
-#     ksp.setOperators(A)
-#     ksp.setType('preonly')
+    # setup petsc for pre-only solve
+    ksp = PETSc.KSP().create(A.getComm())
+    ksp.setOperators(A)
+    ksp.setType('preonly')
 
-#     # set LU w/ MUMPS
-#     pc = ksp.getPC()
-#     pc.setType('lu')
-#     pc.setFactorSolverType('mumps')
+    # set LU w/ MUMPS
+    pc = ksp.getPC()
+    pc.setType('lu')
+    pc.setFactorSolverType('mumps')
 
-#     # solve
-#     ksp.setUp()
-#     ksp.solve(b, x)
+    # solve
+    ksp.setUp()
+    ksp.solve(b, x)

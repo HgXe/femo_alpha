@@ -10,6 +10,7 @@ from femo_alpha.fea.utils_dolfinx import (createCustomMeasure, convertToDense,
                                             assemble)
 from femo_alpha.rm_shell.rm_shell_pde import RMShellPDE
 from femo_alpha.csdl_alpha_opt.fea_model import FEAModel
+from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import custom_solve_direct
 
 class RMShellModel:
     '''
@@ -36,8 +37,8 @@ class RMShellModel:
                             additional_outputs=None,
                             mesh_tags=None,
                             record=True,
-                            rho=100
-                            elementwise_pressure=False):
+                            elementwise_pressure=False,
+                            solve_direct=False):
         '''
         Parameters:
         -----------
@@ -63,6 +64,7 @@ class RMShellModel:
         self.record = record
         self.m, self.rho = 1e-6, rho
         self.PENALTY_BC = PENALTY_BC
+        self.solve_direct = solve_direct
 
         self.nel = mesh.topology.index_map(mesh.topology.dim).size_local
         self.nn = mesh.topology.index_map(0).size_local
@@ -149,7 +151,9 @@ class RMShellModel:
         PENALTY_BC = self.PENALTY_BC
 
         fea = FEA(mesh)
-        fea.PDE_SOLVER = 'Newton'
+        if self.solve_direct:
+            fea.custom_solve = custom_solve_direct
+        # fea.PDE_SOLVER = 'Newton'
         fea.REPORT = False
         fea.record = self.record
         fea.linear_problem = True
