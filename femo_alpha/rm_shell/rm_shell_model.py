@@ -366,14 +366,15 @@ class RMShellModel:
         # print("dMdh_list: ", dMdh_list)
         # exit()
         
-    def evaluate(self, force_vector: csdl.Variable, 
+    def evaluate(self, 
                 thickness: csdl.Variable,
                 E: csdl.Variable, 
                 nu: csdl.Variable, 
                 density: csdl.Variable,
-                node_disp: csdl.Variable=None,
-                debug_mode=False,
-                is_pressure=True) -> csdl.VariableGroup:
+                nodal_forces: csdl.Variable = None,
+                nodal_pressure: csdl.Variable = None,
+                node_disp: csdl.Variable = None,
+                debug_mode=False) -> csdl.VariableGroup:
         '''
         Parameters:
         -----------
@@ -414,24 +415,33 @@ class RMShellModel:
             pressure_mesh_indices = self.shell_pde.mesh.topology.original_cell_index.tolist()
         else:
             pressure_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
-        reshaped_force = csdl.reshape(force_vector[pressure_mesh_indices], (-1,))
-
-        if is_pressure:
-            shell_inputs.F_solid = reshaped_force
-        else:
+        
+        if nodal_forces is not None:
+            reshaped_force = csdl.reshape(nodal_forces[pressure_mesh_indices], (-1,))
             # Compute nodal pressures based on forces
             print('Converting forces to pressures ...')
             A = self.shell_pde.construct_force_to_pressure_map()
-            pressure = csdl.solve_linear(A.toarray(), reshaped_force)
-            shell_inputs.F_solid = pressure
+            pressure_from_forces = csdl.solve_linear(A.toarray(), reshaped_force)
+        if nodal_pressure is not None:
+            reshaped_pressure = csdl.reshape(nodal_pressure[pressure_mesh_indices], (-1,))
+
+        if nodal_forces is not None and nodal_pressure is not None:
+            shell_inputs.F_solid = reshaped_pressure + pressure_from_forces
+        elif nodal_forces is not None:
+            shell_inputs.F_solid = pressure_from_forces
+        elif nodal_pressure is not None:
+            shell_inputs.F_solid = reshaped_pressure
+        else:
+            raise ValueError('Please provide either nodal forces or pressure vector.')
+
         shell_inputs.F_solid.add_name('F_solid')
 
-        # print("="*40)
-        # F_solid_func = Function(self.shell_pde.VF)
-        # F_solid_func.x.array[:] = shell_inputs.F_solid.value
-        # print("Total aero force projected to solid: {}".format(
-        #     [dolfinx.fem.assemble_scalar(dolfinx.fem.form(F_solid_func[i]*ufl.dx)) for i in range(3)]))
-        # print("="*40)
+        print("="*40)
+        F_solid_func = Function(self.shell_pde.VF)
+        F_solid_func.x.array[:] = shell_inputs.F_solid.value
+        print("Total aero force projected to solid: {}".format(
+            [dolfinx.fem.assemble_scalar(dolfinx.fem.form(F_solid_func[i]*ufl.dx)) for i in range(3)]))
+        print("="*40)
 
         # sort the nodal mesh deformation based on FEniCS indices
         deformation_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
