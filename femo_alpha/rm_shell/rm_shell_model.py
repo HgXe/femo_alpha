@@ -38,7 +38,8 @@ class RMShellModel:
                             mesh_tags=None,
                             record=True,
                             elementwise_pressure=False,
-                            solve_direct=False):
+                            solve_direct=False,
+                            recorder_path='records'):
         '''
         Parameters:
         -----------
@@ -62,6 +63,7 @@ class RMShellModel:
         self.shell_bc_func = shell_bc_func # shell bc information
         self.element_wise_material = element_wise_material
         self.record = record
+        self.recorder_path = recorder_path
         self.m, self.rho = 1e-6, rho
         self.PENALTY_BC = PENALTY_BC
         self.solve_direct = solve_direct
@@ -156,6 +158,7 @@ class RMShellModel:
         # fea.PDE_SOLVER = 'Newton'
         fea.REPORT = False
         fea.record = self.record
+        fea.recorder_path = self.recorder_path
         fea.linear_problem = True
         # Add input to the PDE problem:
         h = Function(shell_pde.VT)
