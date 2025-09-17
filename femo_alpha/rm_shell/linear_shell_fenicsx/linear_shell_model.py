@@ -629,21 +629,43 @@ class ElasticModelModal(object):
         return retval
 
 def custom_solve_direct(res, func, bc, report):
-    F = res
+    """
+    Direct (one or more Newton) solve of F(w)=0.
+    Safe to call multiple times: linear case updates once, then residual zero.
+    """
+    from dolfinx.fem import form
+    from dolfinx.fem.petsc import assemble_vector, apply_lifting, set_bc
+    import ufl
+    F = res          # residual form F(w; v)
     w = func
     bcs = bc
-    
-    a = derivative(F, w)
-    L = -F
-    A = assemble_matrix(form(a), bcs)
-    A.assemble()
-    b = assemble_vector(form(L))
-    # b.setArray(f1.vector.getArray())
-    # b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-    dolfinx.fem.set_bc(b, bcs)
 
-    ######### Solve the linear system with KSP solver ############
-    solveKSP_mumps(A, b, w.vector)
+    V = w.function_space
+    du = ufl.TrialFunction(V)
+    # Jacobian (tangent) form
+    J_form = ufl.derivative(F, w, du)
+
+    # Assemble Jacobian
+    A = assemble_matrix(form(J_form), bcs)
+    A.assemble()
+
+    # Assemble residual vector r = F(w)
+    r = assemble_vector(form(F))
+    # Consistent BC treatment (same pattern as Newton in dolfinx)
+    apply_lifting(r, [form(J_form)], [bcs], x0=[w.vector])
+    r.ghostUpdate(PETSc.InsertMode.ADD_VALUES, PETSc.ScatterMode.REVERSE)
+    set_bc(r, bcs, w.vector)
+
+    # Solve J * dw = -r
+    r.scale(-1.0)
+    dw = w.vector.copy()
+    dw.set(0.0)
+    solveKSP_mumps(A, r, dw)
+
+    # Update solution
+    w.vector.axpy(1.0, dw)
+    w.vector.assemble()
+
 
 # def solveNonlinear(F, w, bcs, abs_tol=1e-50, max_it=3, log=False):
 
