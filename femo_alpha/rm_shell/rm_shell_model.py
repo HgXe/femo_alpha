@@ -203,7 +203,10 @@ class RMShellModel:
         # Add output to the PDE problem:
         u_mid, theta = ufl.split(w)
         compliance_form = shell_pde.compliance(u_mid,uhat,h,f)
-        mass_form = shell_pde.mass(uhat, h, density)
+        # mass_form = shell_pde.mass(uhat, h, density)
+        cg_x_num_form, cg_y_num_form, cg_z_num_form, mass_form = shell_pde.cg_form(
+            uhat, h, density
+        )
         elastic_energy_form = shell_pde.elastic_energy(w,uhat,h,E)
         dx_reduced = ufl.Measure('dx', domain=mesh, 
                                  metadata={'quadrature_degree':4})
@@ -231,6 +234,15 @@ class RMShellModel:
                         arguments=['disp_solid','F_solid','thickness','uhat'])
         fea.add_output(name='mass',
                         form=mass_form,
+                        arguments=['thickness','density','uhat'])
+        fea.add_output(name='cgx_num',
+                        form=cg_x_num_form,
+                        arguments=['thickness','density','uhat'])
+        fea.add_output(name='cgy_num',
+                        form=cg_y_num_form,
+                        arguments=['thickness','density','uhat'])
+        fea.add_output(name='cgz_num',
+                        form=cg_z_num_form,
                         arguments=['thickness','density','uhat'])
         fea.add_output(name='elastic_energy',
                         form=elastic_energy_form,
@@ -399,6 +411,7 @@ class RMShellModel:
             > compliance: the compliance of the shell model
             > tip_disp: the tip displacement of the shell model
             > mass: the mass of the shell model
+            > cg: the center of gravity location of the shell model [x,y,z]
         '''
         shell_inputs = csdl.VariableGroup()
 
@@ -494,6 +507,13 @@ class RMShellModel:
                 # average_stress_yz_i = sum_stress_yz_i/area_i
                 # setattr(shell_outputs, 'average_stress_'+str(i), [average_stress_x_i, average_stress_y_i, average_stress_z_i, 
                 #                                                   average_stress_xy_i, average_stress_xz_i, average_stress_yz_i])
+
+        # compute cg location
+        cg_x = shell_outputs.cgx_num / shell_outputs.mass
+        cg_y = shell_outputs.cgy_num / shell_outputs.mass
+        cg_z = shell_outputs.cgz_num / shell_outputs.mass
+        shell_outputs.cg = csdl.concatenate([cg_x, cg_y, cg_z])
+        shell_outputs.cg.add_name('cg')
 
         print('RM shell model evaluation completed.')
         print('-'*40)

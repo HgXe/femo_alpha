@@ -101,6 +101,22 @@ class RMShellPDE:
     def mass(self,uhat,h,rho):
         return rho*h*J(uhat)*dx
     
+    def cg_form(self, uhat, h, rho):
+        """
+        Compute the center of gravity forms.
+        Returns forms for CG_x, CG_y, CG_z numerators and total mass.
+        CG = sum(position * mass) / sum(mass)
+        """
+        x = ufl.SpatialCoordinate(self.mesh)
+        mass_element = rho * h * J(uhat)
+        
+        cg_x_numerator = x[0] * mass_element * dx
+        cg_y_numerator = x[1] * mass_element * dx
+        cg_z_numerator = x[2] * mass_element * dx
+        total_mass = mass_element * dx
+        
+        return cg_x_numerator, cg_y_numerator, cg_z_numerator, total_mass
+    
     def area_subdomain(self,uhat,dxx):
         return J(uhat)*dxx
     
