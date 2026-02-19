@@ -127,7 +127,12 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
                 )
 
         # assemble the derivatives based on the updated state and inputs
-        if self.fea.linear_problem is False or self.fea.opt_iter == 1:
+        # if self.fea.linear_problem is False or self.fea.opt_iter == 1:
+        # NOTE: the above logic caused the derivatives to be wrong after the first iteration.
+        #       Even though the problem is linear wrt the 'state' input (eg pressure), it can 
+        #       be nonlinear wrt other inputs (eg geometry and material thickness). So we need 
+        #       to assemble the derivatives at every iteration.
+        if True: 
             self.assemble_derivatives(input_vals, output_vals)
         
 
