@@ -191,6 +191,10 @@ class MaterialModelComposite(object):
         A_s.vector.setArray(CLT_data[3])
         return A, B, D, A_s
 
+class MaterialModelComposite2(object):
+    def __init__(self, A:Function, B:Function, D:Function, As:Function):
+        self.CLT = A, B, D, As
+
 class ElasticModelShapeOpt(object):
 
     '''
@@ -278,10 +282,10 @@ class ElasticModelShapeOpt(object):
         return 0.5*dot(self.Q,self.gamma)*J(self.uhat)*dx_shear
 
     def membraneEnergy(self, dx_inplane):
-        return 0.5*dot(self.N,voigt2D(self.eps))*dx_inplane
+        return 0.5*dot(self.N,voigt2D(self.eps))*J(self.uhat)*dx_inplane
 
     def bendingEnergy(self, dx_inplane):
-        return 0.5*dot(self.M,voigt2D(self.kappa))*dx_inplane
+        return 0.5*dot(self.M,voigt2D(self.kappa))*J(self.uhat)*dx_inplane
 
     def drillingEnergy(self, E, h, dx_drilling=dx):
         h_mesh = CellDiameter(self.mesh)
@@ -291,7 +295,8 @@ class ElasticModelShapeOpt(object):
                                     dot(self.theta, self.E2)
         # these two scaling factors are consistent in unit
         if (not self.isotropic):
-            alpha = max(self.D.vector.getArray())*12
+            # alpha = max(self.D.vector.getArray())*12 # NOTE: this doesn't work because it can no longer infer the integration domain
+            alpha = 12*self.D[0, 0] # for isotropic materials, D[0,0] is the maximum bending stiffness component, which is consistent with the scaling factor for single-layer isotropic materials
         else:
             alpha = E*h**3
         drilling_stress = alpha*drilling_strain/h_mesh**2
