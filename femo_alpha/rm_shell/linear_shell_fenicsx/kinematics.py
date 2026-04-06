@@ -105,3 +105,17 @@ def voigt2D(T,strain=True):
         fac = 1.0
     return as_vector([T[0,0],T[1,1],fac*T[0,1]])
 
+
+def strain2D_local_to_global(strain_local, T):
+
+    '''
+    Transform a 2x2 in-plane strain tensor in local shell coordinates
+    to a 3x3 tensor in global Cartesian coordinates.
+
+    strain_local: 2x2 strain tensor in local basis (E0, E1)
+    T: 2x3 local basis matrix from global_to_local_inplane(E0, E1)
+    '''
+
+    i,j,k,l = indices(4)
+    return as_tensor(T[k,i]*strain_local[k,l]*T[l,j], (i,j))
+

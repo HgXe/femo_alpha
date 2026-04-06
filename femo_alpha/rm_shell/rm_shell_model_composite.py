@@ -8,11 +8,14 @@ from mpi4py import MPI
 from femo_alpha.fea.fea_dolfinx import FEA
 from femo_alpha.fea.utils_dolfinx import (createCustomMeasure, convertToDense,
                                             assemble)
-from femo_alpha.rm_shell.rm_shell_pde import RMShellPDE
+from femo_alpha.rm_shell.rm_shell_pde_composite import RMShellPDE
 from femo_alpha.csdl_alpha_opt.fea_model import FEAModel
 from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import custom_solve_direct
+from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import strain2D_local_to_global
+from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import voigt2D
 
-class RMShellModel:
+
+class RMShellModelComposite:
     '''
     Class for the RM shell model for aircraft optimization
     ------------------------------------------------------
@@ -29,33 +32,42 @@ class RMShellModel:
     elementwise_pressure: boolean to indicate if the pressure is element-wise or
                             nodal-wise
     '''
-    def __init__(self, mesh: dolfinx.mesh,
-                            shell_bc_func: callable=None, 
-                            element_wise_material=False,
-                            rho=100,
-                            PENALTY_BC=True,
-                            additional_outputs=None,
-                            mesh_tags=None,
-                            record=True,
-                            elementwise_pressure=False,
-                            solve_direct=False,
-                            recorder_path='records'):
+    def __init__(
+        self, 
+        mesh: dolfinx.mesh,
+        shell_bc_func: callable=None, 
+        element_wise_material=False,
+        rho=100,
+        PENALTY_BC=True,
+        additional_outputs=None,
+        mesh_tags=None,
+        record=True,
+        elementwise_pressure=False,
+        solve_direct=False,
+        recorder_path='records',
+        strain_heights = None,
+    ):
         '''
         Parameters:
         -----------
         mesh: dolfinx.mesh object for the shell mesh
         shell_bc_func: callable for shell Dirichlet BC locations - returns True if
-                        it is the boundary location, otherwise returns False
+                       it is the boundary location, otherwise returns False
         element_wise_material: boolean to indicate if the material properties are
-                                defined element-wise or node-wise
+                               defined element-wise or node-wise
         PENALTY_BC: boolean to indicate if the penalty method is used for the
-                        Dirichlet BC
+                    Dirichlet BC
         additional_outputs: dictionary of callable functions to compute additional
                             scalar outputs for the shell model {name:(function, tags)}
         mesh_tags: dictionary {tag: [inds]} where inds are the indicies of elements under
                     the tag. No duplucate indices.
         record: boolean to record the FEA model variables in xdmf format
         rho: float, density of the shell material
+        elementwise_pressure: boolean to indicate if the pressure is defined element-wise or node-wise
+        solve_direct: boolean to indicate if the linear system is solved directly (True) or iteratively (False)
+        recorder_path: string, path to save the recorded FEA variables if record is True
+        strain_heights: list of floats, the heights at which to compute the strain, 
+                        as a fraction of the total thickness offset from the center (ie, -0.5 to 0.5).
         '''
         self.mesh = mesh
         self.mesh_tags = mesh_tags
@@ -67,6 +79,7 @@ class RMShellModel:
         self.m, self.rho = 1e-6, rho
         self.PENALTY_BC = PENALTY_BC
         self.solve_direct = solve_direct
+        self.strain_heights = strain_heights
 
         self.nel = mesh.topology.index_map(mesh.topology.dim).size_local
         self.nn = mesh.topology.index_map(0).size_local
@@ -161,10 +174,12 @@ class RMShellModel:
         fea.recorder_path = self.recorder_path
         fea.linear_problem = True
         # Add input to the PDE problem:
+        A = Function(shell_pde.VABD)
+        B = Function(shell_pde.VABD)
+        D = Function(shell_pde.VABD)
+        As = Function(shell_pde.VAs)
         h = Function(shell_pde.VT)
         f = Function(shell_pde.VF)
-        E = Function(shell_pde.VT)
-        nu = Function(shell_pde.VT)
         density = Function(shell_pde.VT)
         uhat = Function(shell_pde.VU)
 
@@ -187,16 +202,14 @@ class RMShellModel:
                     dolfinx.fem.dirichletbc(ubc, locate_BC2, W.sub(1)),]
             fea.bc = bcs
 
-        # Simple isotropic material
+        # Composite Material PDE residual form
         g = Function(shell_pde.W)
         with g.vector.localForm() as uloc:
             uloc.set(0.)
-        residual_form = shell_pde.pdeRes(h=h, # thickness
-                                         w=w, # displacement
+        residual_form = shell_pde.pdeRes(w=w, # displacement
                                          uhat=uhat, # mesh displacement
                                          f=f, # force
-                                         E=E, # Young's modulus
-                                         nu=nu, # Poisson ratio
+                                         A = A, B=B, D=D, As=As, # composite material stiffness matrices
                                          penalty=PENALTY_BC, 
                                          dss=dss, dSS=dSS, g=g)
 
@@ -207,20 +220,27 @@ class RMShellModel:
         cg_x_num_form, cg_y_num_form, cg_z_num_form, mass_form = shell_pde.cg_form(
             uhat, h, density
         )
-        elastic_energy_form = shell_pde.elastic_energy(w,uhat,h,E)
+        elastic_energy_form = shell_pde.elastic_energy(w,uhat,h,None)
         dx_reduced = ufl.Measure('dx', domain=mesh, 
                                  metadata={'quadrature_degree':4})
-        pnorm_stress_form = shell_pde.pnorm_stress(
-                        w,uhat,h,E,nu,
-                        dx_reduced,m=self.m,rho=self.rho,
-                        alpha=None,regularization=False)
+        strain_form = strain2D_local_to_global(
+            shell_pde.mid_strain,
+            shell_pde.elastic_model.E01,
+        )
 
-        stress_form = shell_pde.von_Mises_stress(
-                        w,uhat,h,E,nu,surface='Top')
+        strain_form_voigt = voigt2D(shell_pde.mid_strain)
+        eps_x = strain_form_voigt[0]
+        eps_y = strain_form_voigt[1]
+        gamma_xy = strain_form_voigt[2]
+        eps_1 = (eps_x + eps_y)/2 + ufl.sqrt(((eps_x - eps_y)/2)**2 + gamma_xy**2)
+
+
         fea.add_input('thickness', h, init_val=0.001, record=self.record)
         fea.add_input('F_solid', f, init_val=1., record=self.record)
-        fea.add_input('E', E, init_val=1., record=self.record)
-        fea.add_input('nu', nu, init_val=1., record=self.record)
+        fea.add_input('A', A, init_val=1., record=self.record)
+        fea.add_input('B', B, init_val=1., record=self.record)
+        fea.add_input('D', D, init_val=1., record=self.record)
+        fea.add_input('As', As, init_val=1., record=self.record)
         fea.add_input('density', density, init_val=1., record=self.record)
         fea.add_input('uhat', uhat, init_val=0., record=self.record)
 
@@ -228,7 +248,7 @@ class RMShellModel:
                         function=w,
                         residual_form=residual_form,
                         arguments=['thickness','F_solid',
-                                    'E','nu','uhat'])
+                                    'A','B','D','As','uhat'])
         fea.add_output(name='compliance',
                         form=compliance_form,
                         arguments=['disp_solid','F_solid','thickness','uhat'])
@@ -246,77 +266,66 @@ class RMShellModel:
                         arguments=['thickness','density','uhat'])
         fea.add_output(name='elastic_energy',
                         form=elastic_energy_form,
-                        arguments=['thickness','disp_solid', 'E','uhat'])
-        fea.add_output(name='pnorm_stress',
-                        form=pnorm_stress_form,
-                        arguments=['thickness','disp_solid','E', 'nu','uhat'])
-
-        fea.add_field_output(name='stress',
-                        form=stress_form,
-                        arguments=['thickness','disp_solid','E', 'nu','uhat'],
-                        element=('DG',1),
-                        record=self.record,
-                        vtk=True)
+                        arguments=['thickness','disp_solid','uhat'])
         
-
-        if self.mesh_tags is not None:
-            for tag, i in self.association_table.items():
-                if i == -1:
-                    continue
-                # Automatically add pnorm stress for each subdomain
-                pnorm_i_stress_form = shell_pde.pnorm_stress(
-                        w,uhat,h,E,nu,
-                        self.dxx(i),m=self.m,rho=self.rho,
-                        alpha=None,regularization=False)
-                fea.add_output(name='pnorm_stress_'+str(tag),
-                            form=pnorm_i_stress_form,
-                            arguments=['thickness','disp_solid','E', 'nu','uhat'])
-
-
-                # stress_sums = shell_pde.sum_stress_subdomain(
-                #                 w,uhat,h,E,nu,self.dxx(i))
-                # area_form = shell_pde.area_subdomain(uhat, self.dxx(i))
-                # fea.add_output(name='sum_stress_x_'+str(i),
-                #             form=stress_sums[0],
-                #             arguments=['thickness','disp_solid','E', 'nu','uhat'])
-                # fea.add_output(name='sum_stress_y_'+str(i),
-                #             form=stress_sums[1],
-                #             arguments=['thickness','disp_solid','E', 'nu','uhat'])
-                # fea.add_output(name='sum_stress_z_'+str(i),
-                #             form=stress_sums[2],
-                #             arguments=['thickness','disp_solid','E', 'nu','uhat'])
-                # fea.add_output(name='sum_stress_xy_'+str(i),
-                #             form=stress_sums[3],
-                #             arguments=['thickness','disp_solid','E', 'nu','uhat'])
-                # fea.add_output(name='sum_stress_xz_'+str(i),
-                #             form=stress_sums[4],
-                #             arguments=['thickness','disp_solid','E', 'nu','uhat'])
-                # fea.add_output(name='sum_stress_yz_'+str(i),
-                #             form=stress_sums[5],
-                #             arguments=['thickness','disp_solid','E', 'nu','uhat'])
-                # fea.add_output(name='area_'+str(i),
-                #             form=area_form,of the following is a correct use of the calc()
-                #             arguments=['uhat'])
-
-            
+        fea.add_field_output(name='eps_1',
+                             form=eps_1,
+                             arguments=['thickness','disp_solid','uhat'],
+                             element=('DG',1),
+                             vtk=True,
+                             record=self.record)
+        
+        plane_strain_element = ufl.TensorElement('DG', mesh.ufl_cell(), degree=1, shape=(3,3))
+        fea.add_field_output(name='strain',
+                            form=strain_form,
+                            arguments=['thickness','disp_solid','uhat'],
+                            element=plane_strain_element,
+                            vtk=True,
+                            record=self.record)
+        
+        if self.strain_heights is not None:
+            shear_strain_form = shell_pde.elastic_model.local_shear_strains()
+            shear_strain_element = ufl.VectorElement('DG', mesh.ufl_cell(), degree=0, dim=2)
+            membrane_strain_element = ufl.TensorElement('DG', mesh.ufl_cell(), degree=0, shape=(2,2))
+            fea.add_field_output(
+                name='shear_strain',
+                form=shear_strain_form,
+                arguments=['thickness','disp_solid','uhat'],
+                element=shear_strain_element,
+                record=self.record,
+            )
+            for i, height in enumerate(self.strain_heights):
+                membrane_strain_form = shell_pde.elastic_model.local_membrane_strains(h*height)
+                fea.add_field_output(
+                    name=f'membrane_strain_{i}',
+                    form=membrane_strain_form,
+                    arguments=['thickness','disp_solid','uhat'],
+                    element=membrane_strain_element,
+                    record=self.record,
+                )
+                
         self.fea = fea
 
-    def evaluate_modal_fea(self, shell_pde, E_val, nu_val, h_val, density_val):
-        from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import (MaterialModel, 
+    def evaluate_modal_fea(self, shell_pde, A_val, B_val, D_val, As_val, h_val, density_val):
+        from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import (MaterialModelComposite2, 
                                                                           ElasticModelModal)
         w = Function(shell_pde.W)
         h = Function(shell_pde.VT)
-        E = Function(shell_pde.VT)
-        nu = Function(shell_pde.VT)
+        A = Function(shell_pde.VABD)
+        B = Function(shell_pde.VABD)
+        D = Function(shell_pde.VABD)
+        As = Function(shell_pde.VAs)
         density = Function(shell_pde.VT)
         h.x.array[:] = h_val
-        E.x.array[:] = E_val
-        nu.x.array[:] = nu_val
+        A.x.array[:] = A_val
+        B.x.array[:] = B_val
+        D.x.array[:] = D_val
+        As.x.array[:] = As_val
         density.x.array[:] = density_val
-        material_model = MaterialModel(E=E,nu=nu,h=h)
+        material_model = MaterialModelComposite2(A=A, B=B, D=D, As=As)
         elastic_model_modal = ElasticModelModal(self.mesh,
                                                 w, material_model.CLT)
-        elastic_energy = elastic_model_modal.elasticEnergy(E, h)
+        elastic_energy = elastic_model_modal.elasticEnergy()
         f_0 = dolfinx.fem.Constant(shell_pde.mesh, (0.0,0.0,0.0))
         elastic_res = elastic_model_modal.weakFormResidual(elastic_energy, f_0)
 
@@ -383,8 +392,10 @@ class RMShellModel:
         
     def evaluate(self, 
                 thickness: csdl.Variable,
-                E: csdl.Variable, 
-                nu: csdl.Variable, 
+                A: csdl.Variable,
+                B: csdl.Variable,
+                D: csdl.Variable,
+                As: csdl.Variable,
                 density: csdl.Variable,
                 nodal_forces: csdl.Variable = None,
                 nodal_pressure: csdl.Variable = None,
@@ -396,8 +407,10 @@ class RMShellModel:
         Vector csdl.Variable:
             > force_vector: the force vector applied on the shell mesh nodes
             > thickness: the thickness on the shell mesh nodes
-            > E: the Young's modulus on the shell mesh nodes
-            > nu: the Poisson's ratio on the shell mesh nodes
+            > A: the A matrix on the shell mesh nodes
+            > B: the B matrix on the shell mesh nodes
+            > D: the D matrix on the shell mesh nodes
+            > As: the As matrix on the shell mesh nodes
             > density: the density on the shell mesh nodes
 
         Returns:
@@ -422,8 +435,10 @@ class RMShellModel:
         else:
             material_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
         shell_inputs.thickness = thickness[material_mesh_indices]
-        shell_inputs.E = E[material_mesh_indices]
-        shell_inputs.nu = nu[material_mesh_indices]
+        shell_inputs.A = A[material_mesh_indices]
+        shell_inputs.B = B[material_mesh_indices]
+        shell_inputs.D = D[material_mesh_indices]
+        shell_inputs.As = As[material_mesh_indices]
         shell_inputs.density = density[material_mesh_indices]
 
         # reshape the force matrix to vector and sort indices
@@ -480,34 +495,6 @@ class RMShellModel:
         disp_extracted.add_name('disp_extracted')
         shell_outputs.disp_extracted = disp_extracted
         
-        aggregated_stress_model = AggregatedStressModel(m=self.m, rho=self.rho)
-        aggregated_stress = aggregated_stress_model.evaluate(shell_outputs.pnorm_stress)
-        aggregated_stress.add_name('aggregated_stress')
-        shell_outputs.aggregated_stress = aggregated_stress
-
-        if self.mesh_tags is not None:
-            for tag, i in self.association_table.items():
-                if i == -1:
-                    continue
-                pnorm_i_stress = getattr(shell_outputs, 'pnorm_stress_'+str(tag))
-                setattr(shell_outputs, 'pnorm_stress_'+str(tag), pnorm_i_stress)
-                
-                # sum_stress_x_i = getattr(shell_outputs, 'sum_stress_x_'+str(i))
-                # sum_stress_y_i = getattr(shell_outputs, 'sum_stress_y_'+str(i))
-                # sum_stress_z_i = getattr(shell_outputs, 'sum_stress_z_'+str(i))
-                # sum_stress_xy_i = getattr(shell_outputs, 'sum_stress_xy_'+str(i))
-                # sum_stress_xz_i = getattr(shell_outputs, 'sum_stress_xz_'+str(i))
-                # sum_stress_yz_i = getattr(shell_outputs, 'sum_stress_yz_'+str(i))
-                # area_i = getattr(shell_outputs, 'area_'+str(i))
-                # average_stress_x_i = sum_stress_x_i/area_i
-                # average_stress_y_i = sum_stress_y_i/area_i
-                # average_stress_z_i = sum_stress_z_i/area_i
-                # average_stress_xy_i = sum_stress_xy_i/area_i
-                # average_stress_xz_i = sum_stress_xz_i/area_i
-                # average_stress_yz_i = sum_stress_yz_i/area_i
-                # setattr(shell_outputs, 'average_stress_'+str(i), [average_stress_x_i, average_stress_y_i, average_stress_z_i, 
-                #                                                   average_stress_xy_i, average_stress_xz_i, average_stress_yz_i])
-
         # compute cg location
         cg_x = shell_outputs.cgx_num / shell_outputs.mass
         cg_y = shell_outputs.cgy_num / shell_outputs.mass
@@ -518,6 +505,12 @@ class RMShellModel:
         print('RM shell model evaluation completed.')
         print('-'*40)
 
+        # Re-order the field outputs to match the input mesh node ordering (FEniCS --> CADDEE)
+        if self.strain_heights is not None:
+            indices = np.argsort(self.shell_pde.mesh.topology.original_cell_index).tolist()
+            shell_outputs.shear_strain = shell_outputs.shear_strain.reshape((-1, 2))[indices, :]
+            for i, height in enumerate(self.strain_heights):
+                shell_outputs.__setattr__(f'membrane_strain_{i}', shell_outputs.__getattribute__(f'membrane_strain_{i}').reshape((-1, 2, 2))[indices, :, :])
 
         # self.evaluate_modal_fea(self.shell_pde, 
         #                       shell_inputs.E.value, 

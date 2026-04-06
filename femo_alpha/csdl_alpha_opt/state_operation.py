@@ -185,8 +185,10 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
                 for arg_name in self.dR_df_dict:
                     if arg_name in d_inputs:
                         dRdf = self.dR_df_dict[arg_name]['dRdf']
-                        d_inputs[arg_name] += computeMatVecProductBwd(
-                                dRdf, self.fea_dR)
+                    d_input_contrib = computeMatVecProductBwd(
+                        dRdf, self.fea_dR)
+                    d_inputs[arg_name] += d_input_contrib.reshape(
+                        d_inputs[arg_name].shape)
         else:
             raise ValueError("mode must be either 'fwd' or 'rev'.")
                                 

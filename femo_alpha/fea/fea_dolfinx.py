@@ -9,7 +9,7 @@ import ufl
 from dolfinx.fem.petsc import apply_lifting
 from dolfinx.fem import (set_bc, Function, FunctionSpace, dirichletbc,
                         locate_dofs_topological, locate_dofs_geometrical,
-                        Constant, VectorFunctionSpace)
+                        Constant, VectorFunctionSpace, TensorFunctionSpace)
 from ufl import (grad, SpatialCoordinate, CellDiameter, FacetNormal,
                     div, Identity, derivative)
 import matplotlib.pyplot as plt
@@ -116,13 +116,13 @@ class FEA(object):
         )
 
     def add_field_output(self, name, form, arguments, 
-                         function_space=('CG', 1),
+                         element=('CG', 1),
                          record=False,
                          vtk=False):
         '''
         Add field output variables to dicitionary
         '''
-        V = FunctionSpace(self.mesh, function_space)
+        V = FunctionSpace(self.mesh, element)
         output_func = Function(V)
         partials = []
         self.outputs_field_dict[name] = dict(
