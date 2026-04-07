@@ -241,6 +241,54 @@ class RMShellPDE:
         # print(disp_extraction_mats.shape)
         return disp_extraction_mats
 
+    def construct_nodal_rot_map(self):
+        '''
+        Construct sparse matrix to extract nodal rotations (theta1, theta2) from mixed state.
+        Since rotations are already CG1 (no projection needed), this simply selects rotation DOFs
+        and organizes them by component for efficient reshaping.
+        Returns:
+            sp.csr_matrix of shape (2*num_nodes, total_state_dofs) that maps mixed state vector
+            to [theta1_values; theta2_values] in nodal order.
+        '''
+        rot_extraction_mats = self.construct_rot_extraction_mats()
+        # Stack the 2 rotation components vertically
+        rot_extraction_mats = sp.vstack(rot_extraction_mats)
+        return rot_extraction_mats
+
+    def construct_rot_extraction_mats(self):
+        '''
+        Generate extraction matrices for the 2 rotation components (theta1, theta2).
+        Unlike displacement extraction, no interpolation is needed because rotations are already CG1.
+        Returns:
+            list of 2 sparse matrices, each of shape (num_nodes, total_state_dofs)
+        '''
+        # Extract rotation space and indices from mixed state
+        rot_space, solid_rot_idxs = self.W.sub(1).collapse()
+        num_rot_dofs = len(solid_rot_idxs)
+        disp_space, solid_disp_idxs = self.W.sub(0).collapse()
+        num_disp_dofs = len(solid_disp_idxs)
+        
+        # Create selector matrix that extracts only rotation DOFs from mixed state
+        rot_mat = sp.lil_matrix((num_rot_dofs, num_disp_dofs + num_rot_dofs))
+        rot_mat[list(range(num_rot_dofs)), solid_rot_idxs] = 1
+        rot_mat.tocsr()
+        
+        # Generate extraction matrices for theta1 and theta2 components
+        rot_component_extraction_mats = []
+        for i in range(2):  # 2 rotation components
+            solid_rot_coord_idxs = rot_space.sub(i).collapse()[1]
+            num_rot_coord_dofs = len(solid_rot_coord_idxs)
+            # Create selector for this component
+            rot_coord_mat = sp.lil_matrix((num_rot_coord_dofs, rot_mat.shape[0]))
+            rot_coord_mat[list(range(num_rot_coord_dofs)), solid_rot_coord_idxs] = 1
+            rot_coord_mat.tocsr()
+            
+            # Compose: component selector × rotation selector
+            rot_coord_mat = rot_coord_mat @ rot_mat
+            rot_component_extraction_mats += [rot_coord_mat]
+        
+        return rot_component_extraction_mats
+
     def construct_disp_extraction_mats(self):
         # first we construct the extraction matrix for all displacements
         disp_space, solid_disp_idxs = self.W.sub(0).collapse()

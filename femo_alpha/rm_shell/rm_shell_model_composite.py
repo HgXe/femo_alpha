@@ -304,6 +304,18 @@ class RMShellModelComposite:
                     record=self.record,
                 )
                 
+        # Add rotation field output
+        rotation_form = shell_pde.elastic_model.theta
+        rotation_element = ufl.VectorElement('CG', mesh.ufl_cell(), degree=1, dim=3)
+        fea.add_field_output(
+            name='rotation',
+            form=rotation_form,
+            arguments=['thickness', 'disp_solid', 'uhat'],
+            element=rotation_element,
+            record=self.record,
+            vtk=False
+        )
+
         self.fea = fea
 
     def evaluate_modal_fea(self, shell_pde, A_val, B_val, D_val, As_val, h_val, density_val):
@@ -495,6 +507,11 @@ class RMShellModelComposite:
         disp_extracted.add_name('disp_extracted')
         shell_outputs.disp_extracted = disp_extracted
         
+        rot_extraction_model = RotationExtractionModel(shell_pde=self.shell_pde)
+        theta_extracted = rot_extraction_model.evaluate(shell_outputs.disp_solid)
+        theta_extracted.add_name('theta_extracted')
+        shell_outputs.theta_extracted = theta_extracted
+        
         # compute cg location
         cg_x = shell_outputs.cgx_num / shell_outputs.mass
         cg_y = shell_outputs.cgy_num / shell_outputs.mass
@@ -511,6 +528,12 @@ class RMShellModelComposite:
             shell_outputs.shear_strain = shell_outputs.shear_strain.reshape((-1, 2))[indices, :]
             for i, height in enumerate(self.strain_heights):
                 shell_outputs.__setattr__(f'membrane_strain_{i}', shell_outputs.__getattribute__(f'membrane_strain_{i}').reshape((-1, 2, 2))[indices, :, :])
+
+        # Re-order the roatation output to match the input mesh node ordering (FEniCS --> CADDEE)
+        fenics_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
+        reverse_fenics_mesh_indices = np.argsort(fenics_mesh_indices).tolist()
+        shell_outputs.rotations = shell_outputs.rotation.reshape((-1, 3))[reverse_fenics_mesh_indices, :]
+
 
         # self.evaluate_modal_fea(self.shell_pde, 
         #                       shell_inputs.E.value, 
@@ -556,6 +579,30 @@ class DisplacementExtractionModel:
         reverse_fenics_mesh_indices = np.argsort(fenics_mesh_indices).tolist()
         reordered_nodal_disp_mat = nodal_disp_mat[reverse_fenics_mesh_indices,:]
         return reordered_nodal_disp_mat
+
+class RotationExtractionModel:
+    '''
+    Extract and reshape rotation vector into matrix (num_nodes, 2)
+    Mirrors DisplacementExtractionModel but for CG1 rotations (no interpolation needed)
+    '''
+    def __init__(self, shell_pde: RMShellPDE):
+        self.shell_pde = shell_pde
+
+    def evaluate(self, disp_vec: csdl.Variable):
+        shell_pde = self.shell_pde
+
+        rot_extraction_mats = shell_pde.construct_nodal_rot_map()
+        # Extract rotation vector from mixed state
+        nodal_rot_vec = csdl.sparse.matvec(rot_extraction_mats, disp_vec)
+        num_nodes = shell_pde.mesh.topology.index_map(0).size_local
+        # Reshape: (2*num_nodes,) -> (2, num_nodes) -> transpose -> (num_nodes, 2)
+        nodal_rot_mat = csdl.transpose(csdl.reshape(nodal_rot_vec, shape=(2, num_nodes)))
+
+        # Reorder to match CADDEE mesh node indices (FEniCS --> CADDEE)
+        fenics_mesh_indices = shell_pde.mesh.geometry.input_global_indices
+        reverse_fenics_mesh_indices = np.argsort(fenics_mesh_indices).tolist()
+        reordered_nodal_rot_mat = nodal_rot_mat[reverse_fenics_mesh_indices, :]
+        return reordered_nodal_rot_mat
 
 class ForceReshapingModel:
     '''
