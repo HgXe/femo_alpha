@@ -37,7 +37,7 @@ class ShellElement():
         self.mesh = mesh
         self.cell = mesh.ufl_cell()
         if element_type == None:
-            self.element_type = 'CG2CG1' # default
+            self.element_type = 'CG1CG1' # default
         else:
             self.element_type = element_type
             
@@ -241,7 +241,7 @@ class ElasticModelShapeOpt(object):
         # otherwise use total offset defined in elastic model
         if offset is None:
             offset = self.offset
-        eps = sym(self.t_gu) - self.offset*self.kappa
+        eps = sym(self.t_gu) - offset*self.kappa
         return eps
 
     def local_bending_curvature(self):
@@ -523,7 +523,7 @@ class ElasticModelModal(object):
         if offset is None:
             offset = self.offset
 
-        eps = sym(self.t_gu) - self.offset*self.kappa
+        eps = sym(self.t_gu) - offset*self.kappa
         return eps
 
     def local_bending_curvature(self):

@@ -22,10 +22,11 @@ class RMShellPDE:
     '''
     Class for the PDE of the Reissner-Mindlin shell element and essential outputs
     '''
-    def __init__(self, mesh, element_wise_material=False, elementwise_pressure=False):
+    def __init__(self, mesh, element_wise_material=False, elementwise_pressure=False, element='CG2CG1'):
         self.mesh = mesh
-        element_type = "CG2CG1"
+        # element_type = "CG2CG1"
         #element_type = "CG2CR1"
+        element_type = element
 
         self.element = element = ShellElement(
                         mesh,
@@ -59,7 +60,6 @@ class RMShellPDE:
                             )
         res = elastic_model.weakFormResidual(elastic_energy, f,
                                             penalty=penalty, dss=dss, dSS=dSS, g=g)
-        self.mid_strain = elastic_model.eps
         return res
         # # Inertia relief
         # f_d = ufl.as_vector([0.,0.,-rho*h*g])

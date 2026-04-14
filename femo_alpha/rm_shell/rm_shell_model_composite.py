@@ -46,6 +46,7 @@ class RMShellModelComposite:
         solve_direct=False,
         recorder_path='records',
         strain_heights = None,
+        element = 'CG2CG1',
     ):
         '''
         Parameters:
@@ -84,6 +85,7 @@ class RMShellModelComposite:
         self.nel = mesh.topology.index_map(mesh.topology.dim).size_local
         self.nn = mesh.topology.index_map(0).size_local
         self.elementwise_pressure = elementwise_pressure
+        self.element = element
 
         if mesh_tags is not None:
             self.set_up_subdomains(mesh_tags)
@@ -159,7 +161,8 @@ class RMShellModelComposite:
         mesh = self.mesh
         shell_pde = self.shell_pde = RMShellPDE(mesh, 
                                                 element_wise_material=self.element_wise_material,
-                                                elementwise_pressure=self.elementwise_pressure)
+                                                elementwise_pressure=self.elementwise_pressure,
+                                                element=self.element)
         dss = self.dss
         dSS = self.dSS
 
@@ -223,16 +226,16 @@ class RMShellModelComposite:
         elastic_energy_form = shell_pde.elastic_energy(w,uhat,h,None)
         dx_reduced = ufl.Measure('dx', domain=mesh, 
                                  metadata={'quadrature_degree':4})
-        strain_form = strain2D_local_to_global(
-            shell_pde.mid_strain,
-            shell_pde.elastic_model.E01,
-        )
+        
+        mid_strain = shell_pde.elastic_model.eps
+        shear_strain = shell_pde.elastic_model.gamma
+        curvature = shell_pde.elastic_model.kappa
 
-        strain_form_voigt = voigt2D(shell_pde.mid_strain)
+        strain_form_voigt = voigt2D(mid_strain)
         eps_x = strain_form_voigt[0]
         eps_y = strain_form_voigt[1]
         gamma_xy = strain_form_voigt[2]
-        eps_1 = (eps_x + eps_y)/2 + ufl.sqrt(((eps_x - eps_y)/2)**2 + gamma_xy**2)
+        eps_1 = (eps_x + eps_y)/2 + ufl.sqrt(((eps_x - eps_y)/2)**2 + (0.5 * gamma_xy)**2)
 
 
         fea.add_input('thickness', h, init_val=0.001, record=self.record)
@@ -271,17 +274,32 @@ class RMShellModelComposite:
         fea.add_field_output(name='eps_1',
                              form=eps_1,
                              arguments=['thickness','disp_solid','uhat'],
-                             element=('DG',1),
-                             vtk=True,
+                             element=('DG',0),
+                             vtk=False,
                              record=self.record)
         
-        plane_strain_element = ufl.TensorElement('DG', mesh.ufl_cell(), degree=1, shape=(3,3))
-        fea.add_field_output(name='strain',
-                            form=strain_form,
-                            arguments=['thickness','disp_solid','uhat'],
+        plane_strain_element = ufl.TensorElement('DG', mesh.ufl_cell(), degree=0, shape=(2,2))
+        fea.add_field_output(name='mid_strain',
+                            form=mid_strain,
+                            arguments=['disp_solid','uhat'],
                             element=plane_strain_element,
-                            vtk=True,
+                            vtk=False,
                             record=self.record)
+        shear_strain_element = ufl.VectorElement('DG', mesh.ufl_cell(), degree=0, dim=2)
+        fea.add_field_output(name='shear_strain',
+                            form=shear_strain,
+                            arguments=['disp_solid','uhat'],
+                            element=shear_strain_element,
+                            vtk=False,
+                            record=self.record)
+        curvature_element = ufl.TensorElement('DG', mesh.ufl_cell(), degree=0, shape=(2,2))
+        fea.add_field_output(name='curvature',
+                            form=curvature,
+                            arguments=['disp_solid','uhat'],
+                            element=curvature_element,
+                            vtk=False,
+                            record=self.record)
+        
         
         if self.strain_heights is not None:
             shear_strain_form = shell_pde.elastic_model.local_shear_strains()
@@ -305,13 +323,25 @@ class RMShellModelComposite:
                 )
                 
         # Add rotation field output
-        rotation_form = shell_pde.elastic_model.theta
+        rotation_form = theta
         rotation_element = ufl.VectorElement('CG', mesh.ufl_cell(), degree=1, dim=3)
         fea.add_field_output(
             name='rotation',
             form=rotation_form,
-            arguments=['thickness', 'disp_solid', 'uhat'],
+            arguments=['disp_solid'],
             element=rotation_element,
+            record=self.record,
+            vtk=False
+        )
+
+        # Add displacement field output
+        displacement_form = u_mid
+        displacement_element = ufl.VectorElement('CG', mesh.ufl_cell(), degree=1, dim=3)
+        fea.add_field_output(
+            name='displacement',
+            form=displacement_form,
+            arguments=['disp_solid'],
+            element=displacement_element,
             record=self.record,
             vtk=False
         )
@@ -502,15 +532,15 @@ class RMShellModelComposite:
         shell_outputs = solid_model.evaluate(shell_inputs, debug_mode=debug_mode)
 
         #:::::::::::::::::::::: Postprocess the outputs ::::::::::::::::::::::::
-        disp_extraction_model = DisplacementExtractionModel(shell_pde=self.shell_pde)
-        disp_extracted = disp_extraction_model.evaluate(shell_outputs.disp_solid)
-        disp_extracted.add_name('disp_extracted')
-        shell_outputs.disp_extracted = disp_extracted
+        # disp_extraction_model = DisplacementExtractionModel(shell_pde=self.shell_pde)
+        # disp_extracted = disp_extraction_model.evaluate(shell_outputs.disp_solid)
+        # disp_extracted.add_name('disp_extracted')
+        # shell_outputs.disp_extracted = disp_extracted
         
-        rot_extraction_model = RotationExtractionModel(shell_pde=self.shell_pde)
-        theta_extracted = rot_extraction_model.evaluate(shell_outputs.disp_solid)
-        theta_extracted.add_name('theta_extracted')
-        shell_outputs.theta_extracted = theta_extracted
+        # rot_extraction_model = RotationExtractionModel(shell_pde=self.shell_pde)
+        # theta_extracted = rot_extraction_model.evaluate(shell_outputs.disp_solid)
+        # theta_extracted.add_name('theta_extracted')
+        # shell_outputs.theta_extracted = theta_extracted
         
         # compute cg location
         cg_x = shell_outputs.cgx_num / shell_outputs.mass
@@ -522,18 +552,29 @@ class RMShellModelComposite:
         print('RM shell model evaluation completed.')
         print('-'*40)
 
-        # Re-order the field outputs to match the input mesh node ordering (FEniCS --> CADDEE)
+        element_indices = np.argsort(self.shell_pde.mesh.topology.original_cell_index).tolist()
+
+        # Re-order the cell-wise field outputs to match the input mesh element ordering (FEniCS --> CADDEE)
         if self.strain_heights is not None:
-            indices = np.argsort(self.shell_pde.mesh.topology.original_cell_index).tolist()
-            shell_outputs.shear_strain = shell_outputs.shear_strain.reshape((-1, 2))[indices, :]
+            shell_outputs.shear_strain = shell_outputs.shear_strain.reshape((-1, 2))[element_indices, :]
             for i, height in enumerate(self.strain_heights):
-                shell_outputs.__setattr__(f'membrane_strain_{i}', shell_outputs.__getattribute__(f'membrane_strain_{i}').reshape((-1, 2, 2))[indices, :, :])
+                shell_outputs.__setattr__(
+                    f'membrane_strain_{i}',
+                    shell_outputs.__getattribute__(f'membrane_strain_{i}').reshape((-1, 2, 2))[element_indices, :, :],
+                )
 
         # Re-order the roatation output to match the input mesh node ordering (FEniCS --> CADDEE)
         fenics_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
         reverse_fenics_mesh_indices = np.argsort(fenics_mesh_indices).tolist()
         shell_outputs.rotations = shell_outputs.rotation.reshape((-1, 3))[reverse_fenics_mesh_indices, :]
 
+        # Re-order the displacement output to match the input mesh node ordering (FEniCS --> CADDEE)
+        shell_outputs.displacements = shell_outputs.displacement.reshape((-1, 3))[reverse_fenics_mesh_indices, :]
+
+        # Re-order the strain outputs to match the input mesh element ordering (FEniCS --> CADDEE)
+        shell_outputs.mid_strain = shell_outputs.mid_strain.reshape((-1, 2, 2))[element_indices, :, :]
+        shell_outputs.shear_strain = shell_outputs.shear_strain.reshape((-1, 2))[element_indices, :]
+        shell_outputs.curvature = shell_outputs.curvature.reshape((-1, 2, 2))[element_indices, :, :]
 
         # self.evaluate_modal_fea(self.shell_pde, 
         #                       shell_inputs.E.value, 
