@@ -12,6 +12,7 @@ from dolfinx.mesh import (create_unit_square, create_rectangle, create_interval,
 from dolfinx.cpp.mesh import CellType
 from dolfinx.fem import (form, assemble_scalar, Function, FunctionSpace,
                         dirichletbc, locate_dofs_geometrical, Constant)
+from dolfinx.fem.forms import form as _create_form
 from dolfinx.fem.petsc import (assemble_vector, assemble_matrix,
                         NonlinearProblem, apply_lifting, set_bc,
                         create_matrix, _assemble_matrix_mat,)
@@ -335,16 +336,79 @@ def computePartials(form, function):
 def createFunction(function):
     return Function(function.function_space)
 
-def solveNonlinear(res, func, bc, solver, report, initialize):
+def _vec_array(vec):
+    return vec.array if hasattr(vec, 'array') else vec.getArray()
+
+
+def _apply_direct_residual_inputs(vec, direct_residual_inputs):
+    if not direct_residual_inputs:
+        return
+
+    vec_array = _vec_array(vec)
+    for direct_input in direct_residual_inputs:
+        values = np.asarray(direct_input['value']).reshape(-1)
+        sign = direct_input.get('sign', -1.0)
+        vec_array[:] += sign * values
+
+
+class DirectVectorNonlinearProblem:
+    def __init__(self, F, u, bcs, J=None, direct_residual_inputs=None):
+        self._L = _create_form(F)
+
+        if J is None:
+            V = u.function_space
+            du = TrialFunction(V)
+            J = derivative(F, u, du)
+
+        self._a = _create_form(J)
+        self.bcs = bcs
+        self.direct_residual_inputs = direct_residual_inputs or []
+
+    @property
+    def L(self):
+        return self._L
+
+    @property
+    def a(self):
+        return self._a
+
+    def form(self, x):
+        x.ghostUpdate(addv=PETSc.InsertMode.INSERT,
+                      mode=PETSc.ScatterMode.FORWARD)
+
+    def F(self, x, b):
+        with b.localForm() as b_local:
+            b_local.set(0.0)
+        assemble_vector(b, self._L)
+        _apply_direct_residual_inputs(b, self.direct_residual_inputs)
+        apply_lifting(b, [self._a], bcs=[self.bcs], x0=[x], scale=-1.0)
+        b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        set_bc(b, self.bcs, x, -1.0)
+
+    def J(self, x, A):
+        A.zeroEntries()
+        _assemble_matrix_mat(A, self._a, self.bcs)
+        A.assemble()
+
+
+def solveNonlinear(res, func, bc, solver, report, initialize,
+                   direct_residual_inputs=None):
     from timeit import default_timer
     start = default_timer()
     if solver == 'Newton':
         newton_solver = NewtonSolver(res, func, bc,
                                     initialize=initialize,
-                                    report=report)
+                                    report=report,
+                                    direct_residual_inputs=direct_residual_inputs)
         newton_solver.solve(func)
     elif solver == 'SNES':
-        snes_solver = SNESSolver(res, func, bc, report=report)
+        snes_solver = SNESSolver(
+            res,
+            func,
+            bc,
+            report=report,
+            direct_residual_inputs=direct_residual_inputs,
+        )
         snes_solver.solve(None, func.vector)
         print('Converged reason:', snes_solver.getConvergedReason())
     stop = default_timer()
@@ -355,7 +419,7 @@ def solveNonlinear(res, func, bc, solver, report, initialize):
 class NonlinearSNESProblem:
 
     def __init__(self, F, u, bcs,
-                 J=None):
+                 J=None, direct_residual_inputs=None):
         self.L = form(F)
 
         # Create the Jacobian matrix, dF/du
@@ -367,6 +431,7 @@ class NonlinearSNESProblem:
         self.a = form(J)
         self.bcs = bcs
         self.u = u
+        self.direct_residual_inputs = direct_residual_inputs or []
 
     def F(self, snes, x, b):
         # Reset the residual vector
@@ -379,6 +444,7 @@ class NonlinearSNESProblem:
         with b.localForm() as b_local:
             b_local.set(0.0)
         assemble_vector(b, self.L)
+        _apply_direct_residual_inputs(b, self.direct_residual_inputs)
 
         # Apply boundary condition
         apply_lifting(b, [self.a], bcs=[self.bcs], x0=[x], scale=-1.0)
@@ -396,13 +462,19 @@ def SNESSolver(F, w, bcs=[],
                     abs_tol=1e-13,
                     rel_tol=1e-13,
                     max_it=100,
-                    report=False):
+                    report=False,
+                    direct_residual_inputs=None):
     '''
     https://github.com/FEniCS/dolfinx/blob/main/python/test/unit/nls/test_newton.py#L182-L205
     '''
     # Create nonlinear problem
 
-    problem = NonlinearSNESProblem(F, w, bcs)
+    problem = NonlinearSNESProblem(
+        F,
+        w,
+        bcs,
+        direct_residual_inputs=direct_residual_inputs,
+    )
 
     W = w.function_space
     b = la.create_petsc_vector(W.dofmap.index_map, W.dofmap.index_map_bs)
@@ -441,13 +513,22 @@ def NewtonSolver(F, w, bcs=[],
                     max_it=3,
                     initialize=False,
                     error_on_nonconvergence=False,
-                    report=False):
+                    report=False,
+                    direct_residual_inputs=None):
 
     '''
     Wrap up the nonlinear solver for the problem F(w)=0 and
     returns the solution
     '''
-    problem = NonlinearProblem(F, w, bcs)
+    if direct_residual_inputs:
+        problem = DirectVectorNonlinearProblem(
+            F,
+            w,
+            bcs,
+            direct_residual_inputs=direct_residual_inputs,
+        )
+    else:
+        problem = NonlinearProblem(F, w, bcs)
     # Set the initial guess of the solution
     if initialize is True:
         with w.vector.localForm() as w_local:

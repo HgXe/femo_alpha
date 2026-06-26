@@ -3,6 +3,11 @@ from femo_alpha.fea.fea_dolfinx import (FEA, update, getFuncArray, computePartia
                                   computeMatVecProductBwd, createFunction,
                                   assembleSystem, setUpKSP_MUMPS)
 import csdl_alpha as csdl
+import numpy as np
+
+
+def is_direct_vector_input(arg):
+    return arg.get("type", "function") in ("vector", "direct_vector")
 
 
 class StateOperation(csdl.experimental.CustomImplicitOperation):
@@ -41,6 +46,7 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
         self.fea_state = self.fea.states_dict[self.state_name]
         self.fea_dR = self.fea_state['d_residual']
         self.fea_du = self.fea_state['d_state']
+        self._default_constrained_dofs = None
 
         self.set_up_fea_derivatives()
 
@@ -98,8 +104,15 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
 
         # update the input values in the FEA model
         self.fea.opt_iter += 1
+        direct_residual_inputs = []
         for arg_name in input_vals:
             arg = self.args_dict[arg_name]
+            if is_direct_vector_input(arg):
+                direct_residual_inputs.append(
+                    self._build_direct_residual_input(arg_name, input_vals[arg_name])
+                )
+                continue
+
             update(arg['function'], input_vals[arg_name])
             if arg['record']:
                 arg['recorder'].write_function(arg['function'], 
@@ -109,7 +122,8 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
         self.fea.solve(
             self.fea_state['residual_form'], 
             self.fea_state['function'], 
-            self.fea.bc
+            self.fea.bc,
+            direct_residual_inputs=direct_residual_inputs,
         )
 
         output_vals[self.state_name] = getFuncArray(self.fea_state['function'])
@@ -167,13 +181,27 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
                     update(self.fea_du, d_outputs[state_name])
                     d_residuals[state_name] += computeMatVecProductFwd(
                             self.dRdu, self.fea_du)
-                for arg_name in self.dR_df_dict:
-                    if arg_name in d_inputs:
-                        update(self.dR_df_dict[arg_name]['df'],
-                                d_inputs[arg_name])
-                        dRdf = self.dR_df_dict[arg_name]['dRdf']
-                        d_residuals[state_name] += computeMatVecProductFwd(
-                                dRdf, self.dR_df_dict[arg_name]['df'])
+                for arg_name, data in self.dR_df_dict.items():
+                    if arg_name not in d_inputs:
+                        continue
+
+                    if data['kind'] == 'direct_vector':
+                        contrib = self._map_direct_input_to_residual(
+                            arg_name,
+                            d_inputs[arg_name],
+                            data,
+                        )
+                        contrib = self._zero_constrained_entries(
+                            contrib,
+                            data.get('constrained_dofs'),
+                        )
+                        d_residuals[state_name] += data.get('sign', -1.0) * contrib
+                        continue
+
+                    update(data['fea_df'], d_inputs[arg_name])
+                    dRdf = data['dRdf']
+                    d_residuals[state_name] += computeMatVecProductFwd(
+                            dRdf, data['fea_df'])
         # for mode = rev
         # d_residuals --> d_inputs
         elif mode == 'rev':
@@ -182,9 +210,27 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
                 # if state_name in d_outputs:
                 #     d_outputs[state_name] += computeMatVecProductBwd(
                 #             self.dRdu, self.fea_dR)
-                for arg_name in self.dR_df_dict:
-                    if arg_name in d_inputs:
-                        dRdf = self.dR_df_dict[arg_name]['dRdf']
+                for arg_name, data in self.dR_df_dict.items():
+                    if arg_name not in d_inputs:
+                        continue
+
+                    if data['kind'] == 'direct_vector':
+                        adjoint = np.asarray(d_residuals[state_name]).reshape(-1)
+                        adjoint = self._zero_constrained_entries(
+                            adjoint,
+                            data.get('constrained_dofs'),
+                        )
+                        scatter = data.get('scatter')
+                        if scatter is None:
+                            contrib = adjoint
+                        else:
+                            contrib = scatter.T @ adjoint
+                        d_inputs[arg_name] += data.get('sign', -1.0) * contrib.reshape(
+                            d_inputs[arg_name].shape
+                        )
+                        continue
+
+                    dRdf = data['dRdf']
                     d_input_contrib = computeMatVecProductBwd(
                         dRdf, self.fea_dR)
                     d_inputs[arg_name] += d_input_contrib.reshape(
@@ -252,15 +298,33 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
         arg_list = self.fea_state['arguments']
         for arg_ind in range(len(arg_list)):
             arg_name = arg_list[arg_ind]
+            arg = self.args_dict[arg_name]
+            if is_direct_vector_input(arg):
+                constrained_dofs = arg.get('constrained_dofs')
+                if constrained_dofs is None:
+                    constrained_dofs = self._get_default_constrained_dofs()
+                dR_df_dict[arg_name] = dict(
+                    kind='direct_vector',
+                    sign=arg.get('sign', -1.0),
+                    shape=arg['shape'],
+                    constrained_dofs=constrained_dofs,
+                    scatter=arg.get('scatter'),
+                )
+                continue
+
             if dR_df_list is None:
                 dR_df = computePartials(
                                     self.fea_state['residual_form'],
-                                    self.args_dict[arg_name]['function'])
+                                    arg['function'])
             else:
                 dR_df = dR_df_list[arg_ind]
 
-            df = createFunction(self.args_dict[arg_name]['function'])
-            dR_df_dict[arg_name] = dict(dR_df=dR_df, fea_df=df)
+            df = createFunction(arg['function'])
+            dR_df_dict[arg_name] = dict(
+                kind='function',
+                dR_df=dR_df,
+                fea_df=df,
+            )
 
         self.dR_df_dict = dR_df_dict
     
@@ -283,11 +347,15 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
         # update the input values in the FEA model
         for arg_name in input_vals:
             arg = self.args_dict[arg_name]
+            if is_direct_vector_input(arg):
+                continue
             update(arg['function'], input_vals[arg_name])
         update(self.fea_state['function'], output_vals[self.state_name])
 
         dR_df_dict = self.dR_df_dict
         for arg_name in dR_df_dict:
+            if dR_df_dict[arg_name]['kind'] == 'direct_vector':
+                continue
             dR_df = dR_df_dict[arg_name]['dR_df']
             dRdf = assembleMatrix(dR_df)
             self.dR_df_dict[arg_name]['dRdf'] = dRdf
@@ -301,3 +369,75 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
                         bcs=self.fea.bc)
 
         self.ksp = setUpKSP_MUMPS(self.A)
+
+    def _get_default_constrained_dofs(self):
+        if self._default_constrained_dofs is not None:
+            return self._default_constrained_dofs
+
+        if not self.fea.bc:
+            self._default_constrained_dofs = None
+            return None
+
+        constrained_dofs = np.unique(np.concatenate([
+            bc.dof_indices()[0] for bc in self.fea.bc
+        ])).astype(int)
+        self._default_constrained_dofs = constrained_dofs
+        return self._default_constrained_dofs
+
+    def _expected_input_size(self, shape):
+        if isinstance(shape, tuple):
+            return int(np.prod(shape))
+        return int(shape)
+
+    def _validate_direct_vector_shape(self, arg_name, values, data):
+        residual_size = self.fea_state['shape']
+        input_size = np.asarray(values).size
+        expected_input_size = self._expected_input_size(data['shape'])
+
+        if input_size != expected_input_size:
+            raise ValueError(
+                f"Direct vector input '{arg_name}' has size {input_size}, "
+                f"expected {expected_input_size}."
+            )
+
+        scatter = data.get('scatter')
+        if scatter is None:
+            if input_size != residual_size:
+                raise ValueError(
+                    f"Direct vector input '{arg_name}' has size {input_size}, "
+                    f"but residual size is {residual_size}."
+                )
+            return
+
+        if scatter.shape[0] != residual_size or scatter.shape[1] != input_size:
+            raise ValueError(
+                f"Direct vector input '{arg_name}' has incompatible scatter shape "
+                f"{scatter.shape}; expected ({residual_size}, {input_size})."
+            )
+
+    def _map_direct_input_to_residual(self, arg_name, values, data):
+        mapped_values = np.asarray(values).reshape(-1)
+        self._validate_direct_vector_shape(arg_name, mapped_values, data)
+        scatter = data.get('scatter')
+        if scatter is None:
+            return mapped_values
+        return np.asarray(scatter @ mapped_values).reshape(-1)
+
+    def _zero_constrained_entries(self, values, constrained_dofs):
+        if constrained_dofs is None:
+            return values
+        values = np.asarray(values).copy()
+        values[np.asarray(constrained_dofs, dtype=int)] = 0.0
+        return values
+
+    def _build_direct_residual_input(self, arg_name, values):
+        data = self.dR_df_dict[arg_name]
+        residual_values = self._map_direct_input_to_residual(
+            arg_name,
+            values,
+            data,
+        )
+        return dict(
+            value=residual_values,
+            sign=data.get('sign', -1.0),
+        )

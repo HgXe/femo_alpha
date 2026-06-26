@@ -68,6 +68,21 @@ class FEA(object):
             record=record
         )
 
+    def add_direct_vector_input(self, name: str, shape: int,
+                                sign=-1.0, record=False,
+                                scatter=None, constrained_dofs=None):
+        if name in self.inputs_dict:
+            raise ValueError('name has already been used for an input')
+        self.inputs_dict[name] = dict(
+            type='direct_vector',
+            shape=shape,
+            sign=sign,
+            scatter=scatter,
+            constrained_dofs=constrained_dofs,
+            recorder=None,
+            record=record,
+        )
+
     def add_state(self, name: str, 
                     function: dolfinx.fem.Function, 
                     residual_form: dolfinx.fem.form, 
@@ -156,7 +171,7 @@ class FEA(object):
             for locate_BC in locate_BC_list:
                 self.bc.append(dirichletbc(ubc, locate_BC, function_space))
 
-    def solve(self, res, func, bc):
+    def solve(self, res, func, bc, direct_residual_inputs=None):
         '''
         Solve the PDE problem
         '''
@@ -167,7 +182,15 @@ class FEA(object):
             self.custom_solve(res,func,bc,report)
             # self.initial_solve = False
         else:
-            solveNonlinear(res,func,bc,solver_type,report,initialize)
+            solveNonlinear(
+                res,
+                func,
+                bc,
+                solver_type,
+                report,
+                initialize,
+                direct_residual_inputs=direct_residual_inputs,
+            )
 
 
     def solveLinearFwd(self, du, A, dR, dR_array, ksp=None):
