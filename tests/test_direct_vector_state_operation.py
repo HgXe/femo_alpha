@@ -276,6 +276,16 @@ def test_total_derivative_through_implicit_direct_vector_matches_fd():
 
     fea_outputs = fea_model.evaluate(inputs)
     q = csdl.sum(fea_outputs.state)
+
+    sim = csdl.experimental.PySimulator(recorder)
+    sim.check_totals(
+        [q],
+        [load_vector],
+        step_size=1e-6,
+        print_results=False,
+        raise_on_error=True,
+    )
+
     dq_dF = csdl.derivative(q, [load_vector])[load_vector]
 
     directional_adj = dq_dF.value.reshape(-1) @ perturbation

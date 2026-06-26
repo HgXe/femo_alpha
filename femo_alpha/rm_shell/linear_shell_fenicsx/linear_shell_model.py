@@ -24,6 +24,7 @@ from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import (J, F, gradx, vo
 from femo_alpha.rm_shell.linear_shell_fenicsx.utils import project
 from dolfinx.fem.petsc import assemble_matrix, assemble_vector
 from petsc4py import PETSc
+from femo_alpha.fea.utils_dolfinx import _apply_direct_residual_inputs
 
 class ShellElement():
 
@@ -655,7 +656,7 @@ class ElasticModelModal(object):
         # retval += drilling_inertia
         return retval
 
-def custom_solve_direct(res, func, bc, report):
+def custom_solve_direct(res, func, bc, report, direct_residual_inputs=None):
     """
     Direct (one or more Newton) solve of F(w)=0.
     Safe to call multiple times: linear case updates once, then residual zero.
@@ -678,6 +679,7 @@ def custom_solve_direct(res, func, bc, report):
 
     # Assemble residual vector r = F(w)
     r = assemble_vector(form(F))
+    _apply_direct_residual_inputs(r, direct_residual_inputs)
     # Consistent BC treatment (same pattern as Newton in dolfinx)
     apply_lifting(r, [form(J_form)], [bcs], x0=[w.vector])
     r.ghostUpdate(PETSc.InsertMode.ADD_VALUES, PETSc.ScatterMode.REVERSE)

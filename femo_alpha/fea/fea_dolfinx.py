@@ -179,7 +179,13 @@ class FEA(object):
         report=self.REPORT
         initialize=self.initialize
         if self.custom_solve is not None and self.initial_solve == True:
-            self.custom_solve(res,func,bc,report)
+            self.custom_solve(
+                res,
+                func,
+                bc,
+                report,
+                direct_residual_inputs=direct_residual_inputs,
+            )
             # self.initial_solve = False
         else:
             solveNonlinear(

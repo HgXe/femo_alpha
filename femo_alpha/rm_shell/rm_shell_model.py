@@ -5,7 +5,7 @@ import ufl
 import numpy as np
 from mpi4py import MPI
 
-from femo_alpha.fea.fea_dolfinx import FEA
+from femo_alpha.fea.fea_dolfinx import FEA, getFuncArray
 from femo_alpha.fea.utils_dolfinx import (createCustomMeasure, convertToDense,
                                             assemble)
 from femo_alpha.rm_shell.rm_shell_pde import RMShellPDE
@@ -204,7 +204,7 @@ class RMShellModel:
 
         # Add output to the PDE problem:
         u_mid, theta = ufl.split(w)
-        compliance_form = shell_pde.compliance(u_mid,uhat,h,f) # TODO: compliance isn't even using f (or m for that matter)
+        compliance_form = shell_pde.compliance(u_mid, theta, uhat, h, f, m)
         # mass_form = shell_pde.mass(uhat, h, density)
         cg_x_num_form, cg_y_num_form, cg_z_num_form, mass_form = shell_pde.cg_form(
             uhat, h, density
@@ -222,6 +222,12 @@ class RMShellModel:
         fea.add_input('thickness', h, init_val=0.001, record=self.record)
         fea.add_input('F_solid', f, init_val=1., record=self.record)
         fea.add_input('M_solid', m, init_val=1., record=self.record)
+        fea.add_direct_vector_input(
+            'load_vector',
+            shape=len(getFuncArray(w)),
+            sign=-1.0,
+            record=False,
+        )
         fea.add_input('E', E, init_val=1., record=self.record)
         fea.add_input('nu', nu, init_val=1., record=self.record)
         fea.add_input('density', density, init_val=1., record=self.record)
@@ -231,10 +237,10 @@ class RMShellModel:
                         function=w,
                         residual_form=residual_form,
                         arguments=['thickness','F_solid','M_solid',
-                                    'E','nu','uhat'])
+                                    'load_vector','E','nu','uhat'])
         fea.add_output(name='compliance',
                         form=compliance_form,
-                        arguments=['disp_solid','F_solid','thickness','uhat'])
+                        arguments=['disp_solid','F_solid','M_solid','thickness','uhat'])
         fea.add_output(name='mass',
                         form=mass_form,
                         arguments=['thickness','density','uhat'])
@@ -391,6 +397,8 @@ class RMShellModel:
                 density: csdl.Variable,
                 nodal_forces: csdl.Variable = None,
                 nodal_pressure: csdl.Variable = None,
+                nodal_moments: csdl.Variable = None,
+                load_vector: csdl.Variable = None,
                 node_disp: csdl.Variable = None,
                 debug_mode=False) -> csdl.VariableGroup:
         '''
@@ -451,9 +459,33 @@ class RMShellModel:
         elif nodal_pressure is not None:
             shell_inputs.F_solid = reshaped_pressure
         else:
-            raise ValueError('Please provide either nodal forces or pressure vector.')
+            shell_inputs.F_solid = csdl.Variable(
+                value=np.zeros(self.fea.inputs_dict['F_solid']['shape']),
+                name='F_solid_zero',
+            )
 
         shell_inputs.F_solid.add_name('F_solid')
+
+        if nodal_moments is not None:
+            shell_inputs.M_solid = csdl.reshape(
+                nodal_moments[pressure_mesh_indices],
+                (-1,),
+            )
+        else:
+            shell_inputs.M_solid = csdl.Variable(
+                value=np.zeros(self.fea.inputs_dict['M_solid']['shape']),
+                name='M_solid_zero',
+            )
+        shell_inputs.M_solid.add_name('M_solid')
+
+        if load_vector is not None:
+            shell_inputs.load_vector = load_vector
+        else:
+            shell_inputs.load_vector = csdl.Variable(
+                value=np.zeros(self.fea.inputs_dict['load_vector']['shape']),
+                name='load_vector_zero',
+            )
+        shell_inputs.load_vector.add_name('load_vector')
 
         print("="*40)
         F_solid_func = Function(self.shell_pde.VF)
@@ -476,6 +508,10 @@ class RMShellModel:
         print('Evaluating the RM shell model ...')
         solid_model = FEAModel(fea=[self.fea], fea_name='rm_shell')
         shell_outputs = solid_model.evaluate(shell_inputs, debug_mode=debug_mode)
+
+        direct_compliance = csdl.vdot(shell_inputs.load_vector, shell_outputs.disp_solid)
+        shell_outputs.compliance = shell_outputs.compliance + direct_compliance
+        shell_outputs.compliance.add_name('compliance')
 
         #:::::::::::::::::::::: Postprocess the outputs ::::::::::::::::::::::::
         disp_extraction_model = DisplacementExtractionModel(shell_pde=self.shell_pde)
@@ -529,6 +565,43 @@ class RMShellModel:
         #                       shell_inputs.density.value)
 
         return shell_outputs
+
+    def assemble_generalized_load_vector(self,
+                                         nodal_forces=None,
+                                         nodal_pressure=None,
+                                         nodal_moments=None,
+                                         node_disp=None):
+        pressure_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
+        deformation_mesh_indices = self.shell_pde.mesh.geometry.input_global_indices
+
+        f_values = np.zeros(self.fea.inputs_dict['F_solid']['shape'])
+        if nodal_forces is not None:
+            reshaped_force = np.asarray(nodal_forces)[pressure_mesh_indices].reshape(-1)
+            pressure_map = self.shell_pde.construct_force_to_pressure_map()
+            f_values += np.linalg.solve(pressure_map.toarray(), reshaped_force)
+        if nodal_pressure is not None:
+            f_values += np.asarray(nodal_pressure)[pressure_mesh_indices].reshape(-1)
+
+        m_values = np.zeros(self.fea.inputs_dict['M_solid']['shape'])
+        if nodal_moments is not None:
+            m_values += np.asarray(nodal_moments)[pressure_mesh_indices].reshape(-1)
+
+        uhat_values = np.zeros(self.fea.inputs_dict['uhat']['shape'])
+        if node_disp is not None:
+            uhat_values = np.asarray(node_disp)[deformation_mesh_indices].reshape(-1)
+
+        f_func = Function(self.shell_pde.VF)
+        m_func = Function(self.shell_pde.VF)
+        uhat_func = Function(self.shell_pde.VU)
+        f_func.x.array[:] = f_values
+        m_func.x.array[:] = m_values
+        uhat_func.x.array[:] = uhat_values
+
+        return self.shell_pde.assemble_generalized_load_vector(
+            uhat=uhat_func,
+            f=f_func,
+            m=m_func,
+        )
 
 
 class AggregatedStressModel:

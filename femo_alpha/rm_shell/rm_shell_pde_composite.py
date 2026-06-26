@@ -66,6 +66,20 @@ class RMShellPDE:
         # res -= inner(f_d,elastic_model.du_mid)*J(uhat)*dx
         # return res
 
+    def assemble_generalized_load_vector(self, uhat, f=None, m=None):
+        dw = TestFunction(self.W)
+        du_mid, dtheta = ufl.split(dw)
+
+        load_form = 0
+        if f is not None:
+            load_form += inner(f, du_mid) * J(uhat) * dx
+        if m is not None:
+            load_form += inner(m, dtheta) * J(uhat) * dx
+        if f is None and m is None:
+            raise ValueError("At least one of f or m must be provided.")
+
+        return assemble_vector(form(load_form)).getArray().copy()
+
     def regularization(self, h, type=None):
         # alpha1 = Constant(self.mesh, 1e1)
         # alpha2 = Constant(self.mesh, 1e0)

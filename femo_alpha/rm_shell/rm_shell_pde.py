@@ -61,6 +61,20 @@ class RMShellPDE:
         # res -= inner(f_d,elastic_model.du_mid)*J(uhat)*dx
         # return res
 
+    def assemble_generalized_load_vector(self, uhat, f=None, m=None):
+        dw = TestFunction(self.W)
+        du_mid, dtheta = ufl.split(dw)
+
+        load_form = 0
+        if f is not None:
+            load_form += inner(f, du_mid) * J(uhat) * dx
+        if m is not None:
+            load_form += inner(m, dtheta) * J(uhat) * dx
+        if f is None and m is None:
+            raise ValueError("At least one of f or m must be provided.")
+
+        return assemble_vector(form(load_form)).getArray().copy()
+
     def regularization(self, h, type=None):
         # alpha1 = Constant(self.mesh, 1e1)
         # alpha2 = Constant(self.mesh, 1e0)
@@ -82,15 +96,10 @@ class RMShellPDE:
         # No regularization
         return regularization
 
-    def compliance(self,u_mid,uhat,h,f):
-        if self.element_wise_material:
-            return inner(u_mid,u_mid)*J(uhat)*ufl.dx + self.regularization(h, type='L2')
-        else:
-            return inner(u_mid,u_mid)*J(uhat)*ufl.dx + self.regularization(h, type='H1')
-        # if self.element_wise_material:
-        #     return inner(u_mid,f)*J(uhat)*ufl.dx + self.regularization(h, type='L2')
-        # else:
-        #     return inner(u_mid,f)*J(uhat)*ufl.dx + self.regularization(h, type='H1')
+    def compliance(self, u_mid, theta, uhat, h, f, m):
+        compliance = inner(u_mid, f) * J(uhat) * ufl.dx
+        compliance += inner(theta, m) * J(uhat) * ufl.dx
+        return compliance
     
     def tip_disp(self,u_mid,uhat,dxx):
         return Constant(self.mesh, 0.5)*inner(u_mid,u_mid)*J(uhat)*dxx
