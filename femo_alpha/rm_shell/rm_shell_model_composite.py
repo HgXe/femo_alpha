@@ -183,6 +183,7 @@ class RMShellModelComposite:
         As = Function(shell_pde.VAs)
         h = Function(shell_pde.VT)
         f = Function(shell_pde.VF)
+        m = Function(shell_pde.VF)
         density = Function(shell_pde.VT)
         uhat = Function(shell_pde.VU)
 
@@ -211,14 +212,14 @@ class RMShellModelComposite:
             uloc.set(0.)
         residual_form = shell_pde.pdeRes(w=w, # displacement
                                          uhat=uhat, # mesh displacement
-                                         f=f, # force
+                                         f=f, m=m, # force and moment (per unit area)
                                          A = A, B=B, D=D, As=As, # composite material stiffness matrices
                                          penalty=PENALTY_BC, 
                                          dss=dss, dSS=dSS, g=g)
 
         # Add output to the PDE problem:
         u_mid, theta = ufl.split(w)
-        compliance_form = shell_pde.compliance(u_mid,uhat,h,f)
+        # compliance_form = shell_pde.compliance(u_mid,uhat,h,f)
         # mass_form = shell_pde.mass(uhat, h, density)
         cg_x_num_form, cg_y_num_form, cg_z_num_form, mass_form = shell_pde.cg_form(
             uhat, h, density
@@ -240,6 +241,7 @@ class RMShellModelComposite:
 
         fea.add_input('thickness', h, init_val=0.001, record=self.record)
         fea.add_input('F_solid', f, init_val=1., record=self.record)
+        fea.add_input('M_solid', m, init_val=1., record=self.record)
         fea.add_input('A', A, init_val=1., record=self.record)
         fea.add_input('B', B, init_val=1., record=self.record)
         fea.add_input('D', D, init_val=1., record=self.record)
@@ -250,11 +252,11 @@ class RMShellModelComposite:
         fea.add_state(name='disp_solid',
                         function=w,
                         residual_form=residual_form,
-                        arguments=['thickness','F_solid',
-                                    'A','B','D','As','uhat'])
-        fea.add_output(name='compliance',
-                        form=compliance_form,
-                        arguments=['disp_solid','F_solid','thickness','uhat'])
+                        arguments=['thickness','F_solid','M_solid',
+                                   'A','B','D','As','uhat'])
+        # fea.add_output(name='compliance',
+        #                 form=compliance_form,
+        #                 arguments=['disp_solid','F_solid','thickness','uhat'])
         fea.add_output(name='mass',
                         form=mass_form,
                         arguments=['thickness','density','uhat'])

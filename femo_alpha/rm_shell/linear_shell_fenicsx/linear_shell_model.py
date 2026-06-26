@@ -312,19 +312,41 @@ class ElasticModelShapeOpt(object):
                 self.bendingEnergy(dx_inplane) + \
                 self.drillingEnergy(E, h)
 
-    def weakFormResidual(self, elasticEnergy, f,
-                        penalty=False, g=None, dss=None, dSS=None):
+    # def weakFormResidual(self, elasticEnergy, f,
+    #                     penalty=False, g=None, dss=None, dSS=None):
 
-        '''
-        Returns the PDE residual of the elasticity problem in weak form,
-        where `f` is the applied body force per unit area.
-        '''
+    #     '''
+    #     Returns the PDE residual of the elasticity problem in weak form,
+    #     where `f` is the applied body force per unit area.
+    #     '''
+    #     dw = TestFunction(self.W)
+    #     self.du_mid,self.dtheta = split(dw)
+    #     retval = derivative(elasticEnergy,self.w,dw)
+    #     if penalty:
+    #         retval += self.penaltyResidual(self.w, dw, g, dss, dSS)
+    #     retval -= inner(f,self.du_mid)*J(self.uhat)*dx
+    #     return retval
+
+    def weakFormResidual(self, elasticEnergy, f=None, m=None,
+                    penalty=False, g=None, dss=None, dSS=None):
+
         dw = TestFunction(self.W)
-        self.du_mid,self.dtheta = split(dw)
-        retval = derivative(elasticEnergy,self.w,dw)
+        self.du_mid, self.dtheta = split(dw)
+
+        retval = derivative(elasticEnergy, self.w, dw)
+
         if penalty:
             retval += self.penaltyResidual(self.w, dw, g, dss, dSS)
-        retval -= inner(f,self.du_mid)*J(self.uhat)*dx
+
+        if f is not None:
+            retval -= inner(f, self.du_mid) * J(self.uhat) * dx
+
+        if m is not None:
+            retval -= inner(m, self.dtheta) * J(self.uhat) * dx
+
+        if f is None and m is None:
+            raise ValueError("At least one of f or m must be provided.")
+
         return retval
 
     def penaltyResidual(self,u,v,g,dss,dSS):

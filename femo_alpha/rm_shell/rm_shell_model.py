@@ -163,6 +163,7 @@ class RMShellModel:
         # Add input to the PDE problem:
         h = Function(shell_pde.VT)
         f = Function(shell_pde.VF)
+        m = Function(shell_pde.VF)
         E = Function(shell_pde.VT)
         nu = Function(shell_pde.VT)
         density = Function(shell_pde.VT)
@@ -195,6 +196,7 @@ class RMShellModel:
                                          w=w, # displacement
                                          uhat=uhat, # mesh displacement
                                          f=f, # force
+                                         m=m, # moment
                                          E=E, # Young's modulus
                                          nu=nu, # Poisson ratio
                                          penalty=PENALTY_BC, 
@@ -202,7 +204,7 @@ class RMShellModel:
 
         # Add output to the PDE problem:
         u_mid, theta = ufl.split(w)
-        compliance_form = shell_pde.compliance(u_mid,uhat,h,f)
+        compliance_form = shell_pde.compliance(u_mid,uhat,h,f) # TODO: compliance isn't even using f (or m for that matter)
         # mass_form = shell_pde.mass(uhat, h, density)
         cg_x_num_form, cg_y_num_form, cg_z_num_form, mass_form = shell_pde.cg_form(
             uhat, h, density
@@ -219,6 +221,7 @@ class RMShellModel:
                         w,uhat,h,E,nu,surface='Top')
         fea.add_input('thickness', h, init_val=0.001, record=self.record)
         fea.add_input('F_solid', f, init_val=1., record=self.record)
+        fea.add_input('M_solid', m, init_val=1., record=self.record)
         fea.add_input('E', E, init_val=1., record=self.record)
         fea.add_input('nu', nu, init_val=1., record=self.record)
         fea.add_input('density', density, init_val=1., record=self.record)
@@ -227,7 +230,7 @@ class RMShellModel:
         fea.add_state(name='disp_solid',
                         function=w,
                         residual_form=residual_form,
-                        arguments=['thickness','F_solid',
+                        arguments=['thickness','F_solid','M_solid',
                                     'E','nu','uhat'])
         fea.add_output(name='compliance',
                         form=compliance_form,

@@ -47,13 +47,13 @@ class RMShellPDE:
                 form(TestFunction(self.VF.sub(0).collapse()[0])*dx)).getArray()
         # self.bf_sup_sizes = np.ones_like(self.bf_sup_sizes)
 
-    def pdeRes(self,h,w,uhat,f,E,nu,penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
+    def pdeRes(self, h, w, uhat, f, m, E, nu, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
         material_model = MaterialModel(E=E,nu=nu,h=h)
         self.elastic_model = elastic_model = ElasticModelShapeOpt(self.mesh,
                                                 w, uhat, material_model.CLT)
         elastic_energy = elastic_model.elasticEnergy(E, h,
                                     self.dx_inplane,self.dx_shear)
-        res = elastic_model.weakFormResidual(elastic_energy, f,
+        res = elastic_model.weakFormResidual(elastic_energy, f=f, m=m,
                                             penalty=penalty, dss=dss, dSS=dSS, g=g)
         return res
         # # Inertia relief
