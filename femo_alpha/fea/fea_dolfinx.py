@@ -238,6 +238,7 @@ class FEA(object):
     def createRecorder(self, name, record=False, vtk=False):
             recorder = None
             if record or self.record:
+                os.makedirs(self.recorder_path, exist_ok=True)
                 if not vtk:
                     recorder = XDMFFile(MPI.COMM_WORLD,
                                         self.recorder_path+'/record_'+name+'.xdmf', 'w')

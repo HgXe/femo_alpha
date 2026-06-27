@@ -82,14 +82,18 @@ else:
 shell_model = RMShellModel(mesh, shell_bc_func=ClampedBoundary, 
                            element_wise_material=element_wise_material,
                            record=True)
-shell_outputs = shell_model.evaluate(pressure_vector, thickness, E, nu, density,
-                                        node_disp,
-                                        debug_mode=False,
-                                        is_pressure=True)
-# shell_outputs = shell_model.evaluate(force_vector, thickness, E, nu, density,
-#                                         node_disp,
-#                                         debug_mode=False,
-#                                         is_pressure=False)
+material = shell_model.material_inputs.from_isotropic(
+    E=E,
+    nu=nu,
+    thickness=thickness,
+    density=density,
+)
+loads = shell_model.load_inputs.from_fields(
+    nodal_pressure=pressure_vector,
+    node_disp=node_disp,
+)
+shell_state = shell_model.solve(material=material, loads=loads, debug_mode=False)
+shell_outputs = shell_model.post.evaluate(state=shell_state, debug_mode=False)
 disp_solid = shell_outputs.disp_solid
 compliance = shell_outputs.compliance
 aggregated_stress = shell_outputs.aggregated_stress

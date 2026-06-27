@@ -40,7 +40,9 @@ class RMShellPDE:
             self.VABD = TensorFunctionSpace(self.mesh, ('DG', 0), shape=(3, 3))
             self.VAs = TensorFunctionSpace(self.mesh, ('DG', 0), shape=(2, 2))
         else:
-            return NotImplementedError("Currently only element-wise material properties are supported.")
+            self.VT = FunctionSpace(mesh, ("CG", 1))
+            self.VABD = TensorFunctionSpace(self.mesh, ('CG', 1), shape=(3, 3))
+            self.VAs = TensorFunctionSpace(self.mesh, ('CG', 1), shape=(2, 2))
         if elementwise_pressure:
             self.VF = VectorFunctionSpace(mesh, ("DG", 0))
         else:
@@ -50,7 +52,7 @@ class RMShellPDE:
                 form(TestFunction(self.VF.sub(0).collapse()[0])*dx)).getArray()
         # self.bf_sup_sizes = np.ones_like(self.bf_sup_sizes)
 
-    def pdeRes(self, w, uhat, f, A, B, D, As, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
+    def pdeRes(self, w, uhat, f, m, A, B, D, As, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
         material_model = MaterialModelComposite2(A, B, D, As)
         self.elastic_model = elastic_model = ElasticModelShapeOpt(self.mesh,
                                                 w, uhat, material_model.CLT)
@@ -58,7 +60,7 @@ class RMShellPDE:
                             dx_inplane=self.dx_inplane,
                             dx_shear=self.dx_shear
                             )
-        res = elastic_model.weakFormResidual(elastic_energy, f,
+        res = elastic_model.weakFormResidual(elastic_energy, f=f, m=m,
                                             penalty=penalty, dss=dss, dSS=dSS, g=g)
         return res
         # # Inertia relief
@@ -101,15 +103,10 @@ class RMShellPDE:
         # No regularization
         return regularization
 
-    def compliance(self,u_mid,uhat,h,f):
-        if self.element_wise_material:
-            return inner(u_mid,u_mid)*J(uhat)*ufl.dx + self.regularization(h, type='L2')
-        else:
-            return inner(u_mid,u_mid)*J(uhat)*ufl.dx + self.regularization(h, type='H1')
-        # if self.element_wise_material:
-        #     return inner(u_mid,f)*J(uhat)*ufl.dx + self.regularization(h, type='L2')
-        # else:
-        #     return inner(u_mid,f)*J(uhat)*ufl.dx + self.regularization(h, type='H1')
+    def compliance(self, u_mid, theta, uhat, h, f, m):
+        compliance = inner(u_mid, f) * J(uhat) * ufl.dx
+        compliance += inner(theta, m) * J(uhat) * ufl.dx
+        return compliance
     
     def tip_disp(self,u_mid,uhat,dxx):
         return Constant(self.mesh, 0.5)*inner(u_mid,u_mid)*J(uhat)*dxx
@@ -139,9 +136,11 @@ class RMShellPDE:
     def area_subdomain(self,uhat,dxx):
         return J(uhat)*dxx
     
-    def elastic_energy(self,w,uhat,h,E):
-        elastic_energy = self.elastic_model.elasticEnergy(E, h, 
-                                        self.dx_inplane, self.dx_shear)
+    def elastic_energy(self, w, uhat, h, E):
+        elastic_energy = self.elastic_model.elasticEnergy(
+            dx_inplane=self.dx_inplane,
+            dx_shear=self.dx_shear,
+        )
         return elastic_energy
 
     def pnorm_stress(self,w,uhat,h,E,nu,dx,m=1e-6,rho=100,alpha=None,regularization=False):

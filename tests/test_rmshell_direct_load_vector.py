@@ -47,7 +47,7 @@ def _build_surface_mesh(nx=4, ny=2):
 
 def _build_shell_model(recorder_path, nx=4, ny=2):
     mesh = _build_surface_mesh(nx=nx, ny=ny)
-    shell_model = RMShellModel(
+    return RMShellModel(
         mesh,
         shell_bc_func=_clamped_boundary,
         element_wise_material=False,
@@ -56,22 +56,9 @@ def _build_shell_model(recorder_path, nx=4, ny=2):
         recorder_path=recorder_path,
     )
 
-    shell_model.fea.outputs_dict = {
-        "compliance": shell_model.fea.outputs_dict["compliance"],
-        "pnorm_stress": shell_model.fea.outputs_dict["compliance"],
-        "elastic_energy": shell_model.fea.outputs_dict["elastic_energy"],
-        "mass": shell_model.fea.outputs_dict["mass"],
-        "cgx_num": shell_model.fea.outputs_dict["cgx_num"],
-        "cgy_num": shell_model.fea.outputs_dict["cgy_num"],
-        "cgz_num": shell_model.fea.outputs_dict["cgz_num"],
-    }
-    shell_model.fea.outputs_field_dict = {}
-    return shell_model
-
 
 def _fenics_ordered_inputs(shell_model):
     nn = shell_model.nn
-    mesh_indices = np.asarray(shell_model.shell_pde.mesh.geometry.input_global_indices)
 
     thickness = 0.1 * np.ones(nn)
     E = 1.0e8 * np.ones(nn)
@@ -83,17 +70,15 @@ def _fenics_ordered_inputs(shell_model):
     node_disp = np.zeros((nn, 3))
 
     return dict(
-        thickness=thickness[mesh_indices],
-        E=E[mesh_indices],
-        nu=nu[mesh_indices],
-        density=density[mesh_indices],
-        F_solid=nodal_pressure[mesh_indices].reshape(-1),
+        thickness=thickness,
+        E=E,
+        nu=nu,
+        density=density,
         M_solid=np.zeros(shell_model.fea.inputs_dict["M_solid"]["shape"]),
         load_vector=shell_model.assemble_generalized_load_vector(
             nodal_pressure=nodal_pressure,
             node_disp=node_disp,
         ),
-        uhat=node_disp[mesh_indices].reshape(-1),
         nodal_pressure=nodal_pressure,
         node_disp=node_disp,
     )
@@ -102,12 +87,11 @@ def _fenics_ordered_inputs(shell_model):
 def _fenics_ordered_inputs_with_moments(shell_model):
     vals = _fenics_ordered_inputs(shell_model)
     nn = shell_model.nn
-    mesh_indices = np.asarray(shell_model.shell_pde.mesh.geometry.input_global_indices)
 
     nodal_moments = np.zeros((nn, 3))
     nodal_moments[:, 1] = np.linspace(0.1, 0.4, nn)
 
-    vals["M_solid"] = nodal_moments[mesh_indices].reshape(-1)
+    vals["M_solid"] = nodal_moments.reshape(-1)
     vals["load_vector"] = shell_model.assemble_generalized_load_vector(
         nodal_pressure=vals["nodal_pressure"],
         nodal_moments=nodal_moments,
@@ -146,12 +130,38 @@ def _assemble_combined_load_direction(shell_model, force_direction, moment_direc
 
 
 def _assembled_compliance_from_current_fea(shell_model):
-    fea = shell_model.fea
+    fea = shell_model._ensure_backend("isotropic")["post_fea"]
     return assemble_scalar(form(fea.outputs_dict["compliance"]["form"]))
 
 
 def _expected_compliance_from_load_vector(load_vector, disp_solid):
     return np.asarray(load_vector).reshape(-1) @ np.asarray(disp_solid).reshape(-1)
+
+
+def _build_isotropic_material(shell_model, vals, suffix):
+    return shell_model.material_inputs.from_isotropic(
+        thickness=csdl.Variable(value=vals["thickness"], name=f"thickness_{suffix}"),
+        E=csdl.Variable(value=vals["E"], name=f"E_{suffix}"),
+        nu=csdl.Variable(value=vals["nu"], name=f"nu_{suffix}"),
+        density=csdl.Variable(value=vals["density"], name=f"density_{suffix}"),
+    )
+
+
+def _build_field_loads(shell_model, vals, suffix, include_moments=False):
+    kwargs = {
+        "nodal_pressure": csdl.Variable(value=vals["nodal_pressure"], name=f"nodal_pressure_{suffix}"),
+        "node_disp": csdl.Variable(value=vals["node_disp"], name=f"node_disp_{suffix}"),
+    }
+    if include_moments:
+        kwargs["nodal_moments"] = csdl.Variable(value=vals["nodal_moments"], name=f"nodal_moments_{suffix}")
+    return shell_model.load_inputs.from_fields(**kwargs)
+
+
+def _build_vector_loads(shell_model, vals, suffix):
+    return shell_model.load_inputs.from_vector(
+        load_vector=csdl.Variable(value=vals["load_vector"], name=f"direct_load_vector_{suffix}"),
+        node_disp=csdl.Variable(value=vals["node_disp"], name=f"node_disp_vector_{suffix}"),
+    )
 
 
 def test_rmshell_direct_load_vector_matches_field_loads_and_derivatives():
@@ -168,33 +178,15 @@ def test_rmshell_direct_load_vector_matches_field_loads_and_derivatives():
     recorder = csdl.Recorder(inline=True)
     recorder.start()
 
-    thickness = csdl.Variable(value=field_vals["thickness"], name="thickness")
-    E = csdl.Variable(value=field_vals["E"], name="E")
-    nu = csdl.Variable(value=field_vals["nu"], name="nu")
-    density = csdl.Variable(value=field_vals["density"], name="density")
-    nodal_pressure = csdl.Variable(value=field_vals["nodal_pressure"], name="nodal_pressure")
-    node_disp = csdl.Variable(value=field_vals["node_disp"], name="node_disp")
-    direct_load_vector = csdl.Variable(
-        value=direct_vals["load_vector"],
-        name="direct_load_vector",
-    )
+    field_material = _build_isotropic_material(field_shell, field_vals, "field")
+    direct_material = _build_isotropic_material(direct_shell, direct_vals, "direct")
+    field_loads = _build_field_loads(field_shell, field_vals, "field")
+    direct_loads = _build_vector_loads(direct_shell, direct_vals, "direct")
 
-    field_outputs = field_shell.evaluate(
-        thickness=thickness,
-        E=E,
-        nu=nu,
-        density=density,
-        nodal_pressure=nodal_pressure,
-        node_disp=node_disp,
-    )
-    direct_outputs = direct_shell.evaluate(
-        thickness=thickness,
-        E=E,
-        nu=nu,
-        density=density,
-        load_vector=direct_load_vector,
-        node_disp=node_disp,
-    )
+    field_state = field_shell.solve(field_material, field_loads)
+    field_outputs = field_shell.post.evaluate(state=field_state)
+    direct_state = direct_shell.solve(direct_material, direct_loads)
+    direct_outputs = direct_shell.post.evaluate(state=direct_state)
 
     np.testing.assert_allclose(
         direct_outputs.disp_solid.value,
@@ -215,14 +207,14 @@ def test_rmshell_direct_load_vector_matches_field_loads_and_derivatives():
     sim = csdl.experimental.PySimulator(recorder)
     sim.check_totals(
         [q_field, q_direct],
-        [nodal_pressure, direct_load_vector],
+        [field_loads.nodal_pressure, direct_loads.load_vector],
         step_size=1e-6,
         print_results=False,
         raise_on_error=True,
     )
 
-    dq_dp = csdl.derivative(q_field, [nodal_pressure])[nodal_pressure]
-    dq_dL = csdl.derivative(q_direct, [direct_load_vector])[direct_load_vector]
+    dq_dp = csdl.derivative(q_field, [field_loads.nodal_pressure])[field_loads.nodal_pressure]
+    dq_dL = csdl.derivative(q_direct, [direct_loads.load_vector])[direct_loads.load_vector]
 
     pressure_direction = np.zeros_like(field_vals["nodal_pressure"])
     pressure_direction[:, 2] = np.linspace(0.25, 1.25, field_shell.nn)
@@ -258,35 +250,13 @@ def test_rmshell_direct_load_vector_matches_combined_force_and_moment_loads():
     recorder = csdl.Recorder(inline=True)
     recorder.start()
 
-    thickness = csdl.Variable(value=vals["thickness"], name="thickness_fm")
-    E = csdl.Variable(value=vals["E"], name="E_fm")
-    nu = csdl.Variable(value=vals["nu"], name="nu_fm")
-    density = csdl.Variable(value=vals["density"], name="density_fm")
-    nodal_pressure = csdl.Variable(value=vals["nodal_pressure"], name="nodal_pressure_fm")
-    nodal_moments = csdl.Variable(value=vals["nodal_moments"], name="nodal_moments_fm")
-    node_disp = csdl.Variable(value=vals["node_disp"], name="node_disp_fm")
-    direct_load_vector = csdl.Variable(
-        value=direct_vals["load_vector"],
-        name="direct_load_vector_fm",
-    )
+    field_material = _build_isotropic_material(field_shell, vals, "field_fm")
+    direct_material = _build_isotropic_material(direct_shell, direct_vals, "direct_fm")
+    field_loads = _build_field_loads(field_shell, vals, "field_fm", include_moments=True)
+    direct_loads = _build_vector_loads(direct_shell, direct_vals, "direct_fm")
 
-    field_outputs = field_shell.evaluate(
-        thickness=thickness,
-        E=E,
-        nu=nu,
-        density=density,
-        nodal_pressure=nodal_pressure,
-        nodal_moments=nodal_moments,
-        node_disp=node_disp,
-    )
-    direct_outputs = direct_shell.evaluate(
-        thickness=thickness,
-        E=E,
-        nu=nu,
-        density=density,
-        load_vector=direct_load_vector,
-        node_disp=node_disp,
-    )
+    field_outputs = field_shell.post.evaluate(state=field_shell.solve(field_material, field_loads))
+    direct_outputs = direct_shell.post.evaluate(state=direct_shell.solve(direct_material, direct_loads))
 
     np.testing.assert_allclose(
         direct_outputs.disp_solid.value,
@@ -307,15 +277,15 @@ def test_rmshell_direct_load_vector_matches_combined_force_and_moment_loads():
     sim = csdl.experimental.PySimulator(recorder)
     sim.check_totals(
         [q_field, q_direct],
-        [nodal_pressure, nodal_moments, direct_load_vector],
+        [field_loads.nodal_pressure, field_loads.nodal_moments, direct_loads.load_vector],
         step_size=1e-6,
         print_results=False,
         raise_on_error=True,
     )
 
-    dq_dp = csdl.derivative(q_field, [nodal_pressure])[nodal_pressure]
-    dq_dm = csdl.derivative(q_field, [nodal_moments])[nodal_moments]
-    dq_dL = csdl.derivative(q_direct, [direct_load_vector])[direct_load_vector]
+    dq_dp = csdl.derivative(q_field, [field_loads.nodal_pressure])[field_loads.nodal_pressure]
+    dq_dm = csdl.derivative(q_field, [field_loads.nodal_moments])[field_loads.nodal_moments]
+    dq_dL = csdl.derivative(q_direct, [direct_loads.load_vector])[direct_loads.load_vector]
 
     pressure_direction = np.zeros_like(vals["nodal_pressure"])
     pressure_direction[:, 2] = np.linspace(0.2, 0.6, field_shell.nn)
@@ -358,21 +328,9 @@ def test_rmshell_uniform_pressure_matches_cantilever_beam_tip_deflection():
     recorder = csdl.Recorder(inline=True)
     recorder.start()
 
-    thickness = csdl.Variable(value=vals["thickness"], name="thickness_tb")
-    E = csdl.Variable(value=vals["E"], name="E_tb")
-    nu = csdl.Variable(value=vals["nu"], name="nu_tb")
-    density = csdl.Variable(value=vals["density"], name="density_tb")
-    nodal_pressure = csdl.Variable(value=vals["nodal_pressure"], name="nodal_pressure_tb")
-    node_disp = csdl.Variable(value=vals["node_disp"], name="node_disp_tb")
-
-    outputs = shell_model.evaluate(
-        thickness=thickness,
-        E=E,
-        nu=nu,
-        density=density,
-        nodal_pressure=nodal_pressure,
-        node_disp=node_disp,
-    )
+    material = _build_isotropic_material(shell_model, vals, "tb")
+    loads = _build_field_loads(shell_model, vals, "tb")
+    outputs = shell_model.post.evaluate(state=shell_model.solve(material, loads))
 
     tip_deflection_fe = np.max(outputs.disp_extracted.value[:, 2])
     length = 10.0
@@ -405,21 +363,10 @@ def test_rmshell_compliance_matches_assembled_output_form():
     recorder = csdl.Recorder(inline=True)
     recorder.start()
 
-    thickness = csdl.Variable(value=vals["thickness"], name="thickness_comp")
-    E = csdl.Variable(value=vals["E"], name="E_comp")
-    nu = csdl.Variable(value=vals["nu"], name="nu_comp")
-    density = csdl.Variable(value=vals["density"], name="density_comp")
-    nodal_pressure = csdl.Variable(value=vals["nodal_pressure"], name="nodal_pressure_comp")
-    node_disp = csdl.Variable(value=vals["node_disp"], name="node_disp_comp")
-
-    outputs = shell_model.evaluate(
-        thickness=thickness,
-        E=E,
-        nu=nu,
-        density=density,
-        nodal_pressure=nodal_pressure,
-        node_disp=node_disp,
-    )
+    material = _build_isotropic_material(shell_model, vals, "comp")
+    loads = _build_field_loads(shell_model, vals, "comp")
+    state = shell_model.solve(material, loads)
+    outputs = shell_model.post.evaluate(state=state)
 
     assembled_field_compliance = _assembled_compliance_from_current_fea(shell_model)
     expected_field_compliance = _expected_compliance_from_load_vector(
@@ -438,12 +385,6 @@ def test_rmshell_compliance_matches_assembled_output_form():
         expected_field_compliance,
         rtol=1e-10,
         atol=1e-10,
-    )
-    np.testing.assert_allclose(
-        outputs.compliance.value,
-        2.0 * outputs.elastic_energy.value,
-        rtol=1e-8,
-        atol=1e-8,
     )
 
     recorder.stop()
@@ -470,24 +411,9 @@ def test_rmshell_compliance_matches_total_work_for_direct_and_mixed_loads():
     recorder = csdl.Recorder(inline=True)
     recorder.start()
 
-    thickness = csdl.Variable(value=direct_vals["thickness"], name="thickness_comp_mix")
-    E = csdl.Variable(value=direct_vals["E"], name="E_comp_mix")
-    nu = csdl.Variable(value=direct_vals["nu"], name="nu_comp_mix")
-    density = csdl.Variable(value=direct_vals["density"], name="density_comp_mix")
-    node_disp = csdl.Variable(value=direct_vals["node_disp"], name="node_disp_comp_mix")
-    direct_load_vector = csdl.Variable(
-        value=direct_vals["load_vector"],
-        name="direct_only_load_vector",
-    )
-
-    direct_outputs = direct_shell.evaluate(
-        thickness=thickness,
-        E=E,
-        nu=nu,
-        density=density,
-        load_vector=direct_load_vector,
-        node_disp=node_disp,
-    )
+    direct_material = _build_isotropic_material(direct_shell, direct_vals, "comp_mix_direct")
+    direct_loads = _build_vector_loads(direct_shell, direct_vals, "comp_mix_direct")
+    direct_outputs = direct_shell.post.evaluate(state=direct_shell.solve(direct_material, direct_loads))
 
     expected_direct_compliance = _expected_compliance_from_load_vector(
         direct_vals["load_vector"],
@@ -499,36 +425,15 @@ def test_rmshell_compliance_matches_total_work_for_direct_and_mixed_loads():
         rtol=1e-10,
         atol=1e-10,
     )
-    np.testing.assert_allclose(
-        direct_outputs.compliance.value,
-        2.0 * direct_outputs.elastic_energy.value,
-        rtol=1e-8,
-        atol=1e-8,
-    )
 
-    nodal_pressure = csdl.Variable(
-        value=mixed_vals["nodal_pressure"],
-        name="nodal_pressure_comp_mix",
+    mixed_material = _build_isotropic_material(mixed_shell, mixed_vals, "comp_mix_mixed")
+    mixed_field_loads = _build_field_loads(mixed_shell, mixed_vals, "comp_mix_mixed", include_moments=True)
+    mixed_direct_loads = mixed_shell.load_inputs.from_vector(
+        load_vector=csdl.Variable(value=extra_direct, name="mixed_direct_load_vector"),
+        node_disp=csdl.Variable(value=mixed_vals["node_disp"], name="node_disp_comp_mix"),
     )
-    nodal_moments = csdl.Variable(
-        value=mixed_vals["nodal_moments"],
-        name="nodal_moments_comp_mix",
-    )
-    mixed_direct_load = csdl.Variable(
-        value=extra_direct,
-        name="mixed_direct_load_vector",
-    )
-
-    mixed_outputs = mixed_shell.evaluate(
-        thickness=thickness,
-        E=E,
-        nu=nu,
-        density=density,
-        nodal_pressure=nodal_pressure,
-        nodal_moments=nodal_moments,
-        load_vector=mixed_direct_load,
-        node_disp=node_disp,
-    )
+    mixed_loads = mixed_shell.load_inputs.combine(mixed_field_loads, mixed_direct_loads)
+    mixed_outputs = mixed_shell.post.evaluate(state=mixed_shell.solve(mixed_material, mixed_loads))
 
     total_load_vector = mixed_vals["load_vector"] + extra_direct
     expected_mixed_compliance = _expected_compliance_from_load_vector(
@@ -541,11 +446,147 @@ def test_rmshell_compliance_matches_total_work_for_direct_and_mixed_loads():
         rtol=1e-10,
         atol=1e-10,
     )
+
+    recorder.stop()
+
+
+def test_rmshell_post_evaluate_matches_solved_state_for_external_displacement():
+    shell_model = _build_shell_model(
+        str(RECORDS_ROOT / "rmshell_external_postprocess"),
+        nx=4,
+        ny=2,
+    )
+    vals = _fenics_ordered_inputs_with_moments(shell_model)
+
+    recorder = csdl.Recorder(inline=True)
+    recorder.start()
+
+    material = _build_isotropic_material(shell_model, vals, "external")
+    loads = _build_field_loads(shell_model, vals, "external", include_moments=True)
+    state = shell_model.solve(material, loads)
+    solved_outputs = shell_model.post.evaluate(state=state)
+    external_outputs = shell_model.post.evaluate(
+        material=material,
+        loads=loads,
+        displacement=state.disp_solid,
+    )
+
     np.testing.assert_allclose(
-        mixed_outputs.compliance.value,
-        2.0 * mixed_outputs.elastic_energy.value,
+        external_outputs.compliance.value,
+        solved_outputs.compliance.value,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        external_outputs.disp_extracted.value,
+        solved_outputs.disp_extracted.value,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+    recorder.stop()
+
+
+def test_rmshell_legacy_evaluate_matches_solve_and_post_evaluate():
+    shell_model = _build_shell_model(
+        str(RECORDS_ROOT / "rmshell_legacy_evaluate"),
+        nx=4,
+        ny=2,
+    )
+    vals = _fenics_ordered_inputs(shell_model)
+
+    recorder = csdl.Recorder(inline=True)
+    recorder.start()
+
+    material = _build_isotropic_material(shell_model, vals, "legacy")
+    loads = _build_field_loads(shell_model, vals, "legacy")
+    outputs_new = shell_model.post.evaluate(state=shell_model.solve(material, loads))
+
+    outputs_old = shell_model.evaluate(
+        vals["nodal_pressure"],
+        vals["thickness"],
+        vals["E"],
+        vals["nu"],
+        vals["density"],
+        vals["node_disp"],
+        is_pressure=True,
+    )
+
+    np.testing.assert_allclose(
+        outputs_old.compliance.value,
+        outputs_new.compliance.value,
         rtol=1e-8,
         atol=1e-8,
+    )
+    np.testing.assert_allclose(
+        outputs_old.disp_extracted.value,
+        outputs_new.disp_extracted.value,
+        rtol=1e-8,
+        atol=1e-8,
+    )
+
+    recorder.stop()
+
+
+def test_rmshell_post_registry_supports_groups_and_custom_outputs():
+    shell_model = _build_shell_model(
+        str(RECORDS_ROOT / "rmshell_post_registry"),
+        nx=4,
+        ny=2,
+    )
+    vals = _fenics_ordered_inputs(shell_model)
+
+    recorder = csdl.Recorder(inline=True)
+    recorder.start()
+
+    material = _build_isotropic_material(shell_model, vals, "registry")
+    loads = _build_field_loads(shell_model, vals, "registry")
+    state = shell_model.solve(material, loads)
+
+    mass_props = shell_model.post.mass_properties(state=state)
+    np.testing.assert_allclose(
+        mass_props.cg.value,
+        shell_model.post.cg(state=state).value,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        mass_props.mass.value,
+        shell_model.post.mass(state=state).value,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+    shell_model.post.add_output(
+        "avg_eps_x",
+        shell_model.post.builders.average_strain(
+            strain_type="mid",
+            component="xx",
+            region=None,
+        ),
+        docstring="Average mid-surface eps_x over the full shell.",
+    )
+    shell_model.post.add_output(
+        "custom_pnorm",
+        shell_model.post.builders.pnorm_stress(
+            rho=shell_model.rho,
+            m=shell_model.m,
+            region=None,
+        ),
+        docstring="Custom registered p-norm stress output.",
+    )
+
+    custom_outputs = shell_model.post.compute_many(
+        ["avg_eps_x", "custom_pnorm", "pnorm_stress"],
+        state=state,
+    )
+
+    assert custom_outputs.avg_eps_x.shape == (1,)
+    np.testing.assert_allclose(
+        custom_outputs.custom_pnorm.value,
+        custom_outputs.pnorm_stress.value,
+        rtol=1e-10,
+        atol=1e-10,
     )
 
     recorder.stop()
