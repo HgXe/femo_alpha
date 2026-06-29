@@ -969,6 +969,11 @@ class RMShellModel:
             post_fea.inputs_dict["nu"]["function"],
             surface="Top",
         )
+        mid_strain = shell_pde.elastic_model.eps
+        shear_strain = shell_pde.elastic_model.gamma
+        curvature = shell_pde.elastic_model.kappa
+        plane_strain_element = ufl.TensorElement("DG", self.mesh.ufl_cell(), degree=0, shape=(2, 2))
+        shear_strain_element = ufl.VectorElement("DG", self.mesh.ufl_cell(), degree=0, dim=2)
         rotation_element = ufl.VectorElement("CG", self.mesh.ufl_cell(), degree=1, dim=3)
         displacement_element = ufl.VectorElement("CG", self.mesh.ufl_cell(), degree=1, dim=3)
 
@@ -980,6 +985,9 @@ class RMShellModel:
         post_fea.add_output("elastic_energy", elastic_energy_form, ["thickness", "disp_solid", "E", "uhat"])
         post_fea.add_output("pnorm_stress", pnorm_stress_form, ["thickness", "disp_solid", "E", "nu", "uhat"])
         post_fea.add_field_output("stress", stress_form, ["thickness", "disp_solid", "E", "nu", "uhat"], element=("DG", 1), record=False, vtk=False)
+        post_fea.add_field_output("mid_strain", mid_strain, ["disp_solid", "uhat"], element=plane_strain_element, vtk=False, record=False)
+        post_fea.add_field_output("shear_strain", shear_strain, ["disp_solid", "uhat"], element=shear_strain_element, vtk=False, record=False)
+        post_fea.add_field_output("curvature", curvature, ["disp_solid", "uhat"], element=plane_strain_element, vtk=False, record=False)
         post_fea.add_field_output("rotation", theta, ["disp_solid"], element=rotation_element, record=False, vtk=False)
         post_fea.add_field_output("displacement", u_mid, ["disp_solid"], element=displacement_element, record=False, vtk=False)
 

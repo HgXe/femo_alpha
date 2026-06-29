@@ -6,8 +6,14 @@ and is more of a collection of run scripts for reference/benchmarking.
 Examples may contain documentation in the form of comments.
 However, outputs/visualization from running the script is excluded if you are using Python files.
 
-If no classification of examples is required, just remove the subpages for examples
-and add the example files directly into the toctree of this main examples page.
+The current RMShell examples use the explicit interface:
+
+- `shell.material_inputs...`
+- `shell.load_inputs...`
+- `shell.solve(...)`
+- `shell.post.evaluate(...)`
+
+Use the tutorial for a more explanatory walkthrough and the examples for runnable reference cases.
 
 ```{toctree}
 :maxdepth: 3

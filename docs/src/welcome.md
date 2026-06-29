@@ -38,6 +38,8 @@ The **F**inite **E**lements for **M**ultidisciplinary **O**ptimization (**FEMO**
 :hidden:
 
 src/getting_started
+src/rmshell
+src/tutorials
 src/examples
 src/api
 ```

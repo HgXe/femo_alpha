@@ -1,6 +1,5 @@
 # Getting started
-This page provides instructions for installing your package 
-and running a minimal example.
+This page provides instructions for installing `femo_alpha` and running a minimal example.
 
 ## Installation
 
@@ -38,11 +37,10 @@ It's recommended to use conda for installing the module and its dependencies.
   ```
 
 
-## Setting up Testing
-To test if your installation was successful, run 
+## Quick verification
+To test if your installation was successful, run
 `ex_thickness_opt_cantilever_beam.py` from `/femo_alpha/examples/basic_examples/beam_thickness_opt/`.
-If everything works correctly, the following terminal output will
-be displayed.
+If everything works correctly, the following terminal output will be displayed.
 
 ![beam_thickness_opt](/src/images/beam_thickness_distribution.png "Optimal beam thickness distribution")
 
@@ -67,3 +65,49 @@ Optimization results:
 OpenMDAO compliance: 23762.153677443166
 
 ```
+
+## RMShell quick start
+
+The recommended shell workflow is now explicit:
+
+1. construct an `RMShellModel`
+2. create canonical material and load inputs
+3. call `solve(...)`
+4. postprocess through `shell.post`
+
+```python
+from femo_alpha.rm_shell.rm_shell_model import RMShellModel
+
+shell = RMShellModel(
+    mesh,
+    shell_bc_func=clamped_boundary,
+    record=False,
+)
+
+material = shell.material_inputs.from_isotropic(
+    E=E,
+    nu=nu,
+    thickness=thickness,
+    density=density,
+)
+
+loads = shell.load_inputs.from_fields(
+    nodal_pressure=nodal_pressure,
+    node_disp=node_disp,
+)
+
+state = shell.solve(material=material, loads=loads)
+outputs = shell.post.evaluate(state=state)
+```
+
+Direct generalized shell load vectors are also supported:
+
+```python
+loads = shell.load_inputs.from_vector(
+    load_vector=load_vector,
+    node_disp=node_disp,
+)
+state = shell.solve(material=material, loads=loads)
+```
+
+For a fuller walkthrough, including postprocessing and custom outputs, see the RMShell tutorial and interface reference.
