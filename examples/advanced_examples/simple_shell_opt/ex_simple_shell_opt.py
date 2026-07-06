@@ -90,9 +90,8 @@ material = shell_model.material_inputs.from_isotropic(
 )
 loads = shell_model.load_inputs.from_fields(
     nodal_pressure=pressure_vector,
-    node_disp=node_disp,
 )
-shell_state = shell_model.solve(material=material, loads=loads, debug_mode=False)
+shell_state = shell_model.solve(material=material, loads=loads, node_disp=node_disp, debug_mode=False)
 shell_outputs = shell_model.post.evaluate(state=shell_state, debug_mode=False)
 disp_solid = shell_outputs.disp_solid
 compliance = shell_outputs.compliance

@@ -22,9 +22,9 @@ class RMShellPDE:
     '''
     Class for the PDE of the Reissner-Mindlin shell element and essential outputs
     '''
-    def __init__(self, mesh, element_wise_material=False, elementwise_pressure=False):
+    def __init__(self, mesh, element_wise_material=False, elementwise_pressure=False, element='CG2CG1'):
         self.mesh = mesh
-        element_type = "CG2CG1"
+        element_type = element
         #element_type = "CG2CR1"
 
         self.element = element = ShellElement(

@@ -8,7 +8,6 @@ import copy
 
 from femo_alpha.fea.fea_dolfinx import FEA, getFuncArray
 from femo_alpha.fea.utils_dolfinx import createCustomMeasure
-from femo_alpha.rm_shell.rm_shell_pde import RMShellPDE as IsotropicShellPDE
 from femo_alpha.rm_shell.rm_shell_pde_composite import RMShellPDE as CompositeShellPDE
 from femo_alpha.csdl_alpha_opt.fea_model import FEAModel
 from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import custom_solve_direct
@@ -17,10 +16,10 @@ from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import custom_s
 class ShellState:
     """Container for the solved shell state and the inputs used to obtain it."""
 
-    def __init__(self, backend_name, material, loads, disp_solid, uhat, raw_outputs):
-        self.backend_name = backend_name
+    def __init__(self, material, loads, node_disp, disp_solid, uhat, raw_outputs):
         self.material = material
         self.loads = loads
+        self.node_disp = node_disp
         self.disp_solid = disp_solid
         self.uhat = uhat
         self.raw_outputs = raw_outputs
@@ -79,7 +78,8 @@ class MaterialInputFactory:
         )
 
         material = csdl.VariableGroup()
-        material.kind = "isotropic"
+        material.kind = "abd"
+        material.is_isotropic = True
         material.thickness = thickness
         material.E = E
         material.nu = nu
@@ -93,7 +93,8 @@ class MaterialInputFactory:
     def from_abd(self, A, B, D, As, thickness, density):
         """Create canonical shell material inputs directly from A/B/D/As matrices."""
         material = csdl.VariableGroup()
-        material.kind = "general_abd"
+        material.kind = "abd"
+        material.is_isotropic = False
         material.thickness = self.shell_model._ensure_variable(thickness, "thickness")
         material.A = self.shell_model._ensure_variable(A, "A")
         material.B = self.shell_model._ensure_variable(B, "B")
@@ -109,24 +110,22 @@ class LoadInputFactory:
     def __init__(self, shell_model):
         self.shell_model = shell_model
 
-    def from_fields(self, nodal_forces=None, nodal_pressure=None, nodal_moments=None, node_disp=None):
+    def from_fields(self, nodal_forces=None, nodal_pressure=None, nodal_moments=None):
         """Create a load group from nodal force, pressure, and moment fields."""
         loads = csdl.VariableGroup()
         loads.nodal_forces = self.shell_model._maybe_variable(nodal_forces, "nodal_forces")
         loads.nodal_pressure = self.shell_model._maybe_variable(nodal_pressure, "nodal_pressure")
         loads.nodal_moments = self.shell_model._maybe_variable(nodal_moments, "nodal_moments")
         loads.load_vector = None
-        loads.node_disp = self.shell_model._maybe_variable(node_disp, "node_disp")
         return loads
 
-    def from_vector(self, load_vector, node_disp=None):
+    def from_vector(self, load_vector):
         """Create a load group from a direct generalized shell load vector."""
         loads = csdl.VariableGroup()
         loads.nodal_forces = None
         loads.nodal_pressure = None
         loads.nodal_moments = None
         loads.load_vector = self.shell_model._ensure_variable(load_vector, "load_vector")
-        loads.node_disp = self.shell_model._maybe_variable(node_disp, "node_disp")
         return loads
 
     def combine(self, *load_groups):
@@ -141,8 +140,6 @@ class LoadInputFactory:
                     continue
                 current = getattr(combined, name, None)
                 setattr(combined, name, val if current is None else current + val)
-            if getattr(group, "node_disp", None) is not None:
-                combined.node_disp = group.node_disp
         return combined
 
 
@@ -159,23 +156,21 @@ class PostOutputSpec:
 class ShellPostContext:
     """Evaluation context for shell postprocessing outputs."""
 
-    def __init__(self, post_processor, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def __init__(self, post_processor, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         self.post = post_processor
         self.shell_model = post_processor.shell_model
         if state is not None:
             material = state.material
             loads = state.loads
             displacement = state.disp_solid
-            backend_name = state.backend_name
+            node_disp = state.node_disp
         else:
             if material is None or loads is None or displacement is None:
                 raise ValueError("Provide either a ShellState or material, loads, and displacement.")
-            backend_name = self.shell_model._select_backend(material)
         self.state = state
-        self.backend_name = backend_name
-        self.backend = self.shell_model._ensure_backend(backend_name)
         self.material = material
         self.loads = loads
+        self.node_disp = node_disp
         self.displacement = displacement
         self.debug_mode = debug_mode
         self._cache = {}
@@ -183,18 +178,18 @@ class ShellPostContext:
 
     @property
     def shell_pde(self):
-        """Return the backend shell PDE object used by this context."""
-        return self.backend["shell_pde"]
+        """Return the shell PDE object used by this context."""
+        return self.shell_model.shell_pde
 
     @property
     def post_fea(self):
-        """Return the backend postprocessing FEA object used by this context."""
-        return self.backend["post_fea"]
+        """Return the postprocessing FEA object used by this context."""
+        return self.shell_model.post_fea
 
     @property
     def solve_fea(self):
-        """Return the backend solve FEA object used by this context."""
-        return self.backend["solve_fea"]
+        """Return the solve FEA object used by this context."""
+        return self.shell_model.fea
 
     def inputs(self):
         """Return the CSDL inputs used for postprocessing in FEniCS ordering."""
@@ -202,7 +197,7 @@ class ShellPostContext:
             self._post_inputs = self.shell_model._prepare_solver_inputs(
                 self.material,
                 self.loads,
-                self.backend_name,
+                node_disp=self.node_disp,
             )
             self._post_inputs.disp_solid = self.displacement
         return self._post_inputs
@@ -245,14 +240,10 @@ class ShellPostBuilderFactory:
         "yx": (1, 0),
     }
 
-    def scalar_form(self, form_fn, arguments, backend=None, docstring=None):
+    def scalar_form(self, form_fn, arguments, docstring=None):
         """Create a scalar-output builder from a UFL form callback."""
 
         def builder(context):
-            if backend is not None and context.backend_name != backend:
-                raise ValueError(
-                    f"Output is only defined for backend '{backend}', not '{context.backend_name}'."
-                )
             return PostOutputSpec(
                 name="",
                 kind="scalar_form_builder",
@@ -263,14 +254,10 @@ class ShellPostBuilderFactory:
 
         return builder
 
-    def field_form(self, form_fn, arguments, element, backend=None, reorder=None, docstring=None):
+    def field_form(self, form_fn, arguments, element, reorder=None, docstring=None):
         """Create a field-output builder from a UFL form callback."""
 
         def builder(context):
-            if backend is not None and context.backend_name != backend:
-                raise ValueError(
-                    f"Output is only defined for backend '{backend}', not '{context.backend_name}'."
-                )
             return PostOutputSpec(
                 name="",
                 kind="field_form_builder",
@@ -322,8 +309,8 @@ class ShellPostBuilderFactory:
         """Create a builder for region-restricted p-norm von Mises stress."""
 
         def builder(context):
-            if context.backend_name != "isotropic":
-                raise ValueError("pnorm_stress builder is currently only supported for isotropic materials.")
+            if not getattr(context.material, "is_isotropic", False):
+                raise ValueError("pnorm_stress requires material created with from_isotropic(...).")
             post_fea = context.post_fea
             dx_measure = ufl.Measure("dx", domain=context.shell_model.mesh, metadata={"quadrature_degree": 4})
             if region is not None:
@@ -345,6 +332,36 @@ class ShellPostBuilderFactory:
                 kind="scalar_form_builder",
                 form=pnorm_form,
                 arguments=["disp_solid", "thickness", "E", "nu", "uhat"],
+            )
+
+        return builder
+
+    def von_mises_stress(self, surface="top"):
+        """Create a projected von Mises stress field builder for isotropic materials."""
+        surface_map = {"top": "Top", "mid": "Mid", "middle": "Mid", "bottom": "Bot", "bot": "Bot"}
+        surface_key = surface.lower()
+        if surface_key not in surface_map:
+            raise ValueError("surface must be one of 'top', 'mid', or 'bottom'.")
+        pde_surface = surface_map[surface_key]
+
+        def builder(context):
+            if not getattr(context.material, "is_isotropic", False):
+                raise ValueError("von_mises_stress requires material created with from_isotropic(...).")
+            post_fea = context.post_fea
+            stress_form = context.shell_pde.von_Mises_stress(
+                post_fea.inputs_dict["disp_solid"]["function"],
+                post_fea.inputs_dict["uhat"]["function"],
+                post_fea.inputs_dict["thickness"]["function"],
+                post_fea.inputs_dict["E"]["function"],
+                post_fea.inputs_dict["nu"]["function"],
+                surface=pde_surface,
+            )
+            return PostOutputSpec(
+                name="",
+                kind="field_form_builder",
+                form=stress_form,
+                arguments=["thickness", "disp_solid", "E", "nu", "uhat"],
+                element=("DG", 1),
             )
 
         return builder
@@ -377,8 +394,11 @@ class ShellPostProcessor:
         self._registry["cgy_num"] = PostOutputSpec("cgy_num", "scalar_fea_output")
         self._registry["cgz_num"] = PostOutputSpec("cgz_num", "scalar_fea_output")
         self._registry["elastic_energy"] = PostOutputSpec("elastic_energy", "scalar_fea_output")
-        self._registry["pnorm_stress"] = PostOutputSpec("pnorm_stress", "scalar_fea_output")
-        self._registry["stress"] = PostOutputSpec("stress", "field_fea_output")
+        self._registry["pnorm_stress"] = PostOutputSpec("pnorm_stress", "custom_builder", builder=self.builders.pnorm_stress())
+        self._registry["stress"] = PostOutputSpec("stress", "custom_builder", builder=self.builders.von_mises_stress("top"))
+        self._registry["stress_top"] = PostOutputSpec("stress_top", "custom_builder", builder=self.builders.von_mises_stress("top"))
+        self._registry["stress_mid"] = PostOutputSpec("stress_mid", "custom_builder", builder=self.builders.von_mises_stress("mid"))
+        self._registry["stress_bottom"] = PostOutputSpec("stress_bottom", "custom_builder", builder=self.builders.von_mises_stress("bottom"))
         self._registry["rotation"] = PostOutputSpec("rotation", "field_fea_output")
         self._registry["displacement"] = PostOutputSpec("displacement", "field_fea_output")
         self._registry["mid_strain"] = PostOutputSpec("mid_strain", "field_fea_output")
@@ -390,7 +410,7 @@ class ShellPostProcessor:
         self._registry["displacements"] = PostOutputSpec("displacements", "derived_builtin")
         self._registry["rotations"] = PostOutputSpec("rotations", "derived_builtin")
 
-    def context(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def context(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Create a reusable postprocessing context for a solved or external displacement."""
         return ShellPostContext(
             self,
@@ -398,6 +418,7 @@ class ShellPostProcessor:
             material=material,
             loads=loads,
             displacement=displacement,
+            node_disp=node_disp,
             debug_mode=debug_mode,
         )
 
@@ -422,13 +443,14 @@ class ShellPostProcessor:
         """Register a custom postprocessing output from a builder callback."""
         self._registry[name] = PostOutputSpec(name, "custom_builder", builder=builder, docstring=docstring)
 
-    def evaluate(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def evaluate(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compatibility wrapper returning the default set of postprocessing outputs."""
         context = self.context(
             state=state,
             material=material,
             loads=loads,
             displacement=displacement,
+            node_disp=node_disp,
             debug_mode=debug_mode,
         )
         outputs = self.compute_many(
@@ -439,7 +461,7 @@ class ShellPostProcessor:
         outputs.uhat = context.inputs().uhat
         return outputs
 
-    def compute(self, name, state=None, material=None, loads=None, displacement=None, debug_mode=False, context=None):
+    def compute(self, name, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False, context=None):
         """Compute one named postprocessing output."""
         if context is None:
             context = self.context(
@@ -447,6 +469,7 @@ class ShellPostProcessor:
                 material=material,
                 loads=loads,
                 displacement=displacement,
+                node_disp=node_disp,
                 debug_mode=debug_mode,
             )
         if name in context._cache:
@@ -454,7 +477,7 @@ class ShellPostProcessor:
         results = self.compute_many([name], context=context)
         return getattr(results, name)
 
-    def compute_many(self, names, state=None, material=None, loads=None, displacement=None, debug_mode=False, context=None):
+    def compute_many(self, names, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False, context=None):
         """Compute multiple named postprocessing outputs and return them in a VariableGroup."""
         if context is None:
             context = self.context(
@@ -462,6 +485,7 @@ class ShellPostProcessor:
                 material=material,
                 loads=loads,
                 displacement=displacement,
+                node_disp=node_disp,
                 debug_mode=debug_mode,
             )
         result = csdl.VariableGroup()
@@ -515,7 +539,7 @@ class ShellPostProcessor:
                 setattr(result, name, context._cache[name])
         return result
 
-    def mass_properties(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def mass_properties(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compute mass and center of gravity outputs together."""
         return self.compute_many(
             ["mass", "cg", "cgx_num", "cgy_num", "cgz_num"],
@@ -523,10 +547,11 @@ class ShellPostProcessor:
             material=material,
             loads=loads,
             displacement=displacement,
+            node_disp=node_disp,
             debug_mode=debug_mode,
         )
 
-    def kinematics(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def kinematics(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compute displacement and rotation kinematic outputs together."""
         return self.compute_many(
             ["disp_extracted", "displacements", "rotations"],
@@ -534,10 +559,11 @@ class ShellPostProcessor:
             material=material,
             loads=loads,
             displacement=displacement,
+            node_disp=node_disp,
             debug_mode=debug_mode,
         )
 
-    def strains(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def strains(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compute strain-related field outputs together."""
         return self.compute_many(
             ["mid_strain", "shear_strain", "curvature"],
@@ -545,32 +571,33 @@ class ShellPostProcessor:
             material=material,
             loads=loads,
             displacement=displacement,
+            node_disp=node_disp,
             debug_mode=debug_mode,
         )
 
-    def compliance(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def compliance(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compute compliance only."""
-        return self.compute("compliance", state=state, material=material, loads=loads, displacement=displacement, debug_mode=debug_mode)
+        return self.compute("compliance", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
 
-    def mass(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def mass(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compute mass only."""
-        return self.compute("mass", state=state, material=material, loads=loads, displacement=displacement, debug_mode=debug_mode)
+        return self.compute("mass", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
 
-    def cg(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def cg(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compute center of gravity only."""
-        return self.compute("cg", state=state, material=material, loads=loads, displacement=displacement, debug_mode=debug_mode)
+        return self.compute("cg", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
 
-    def disp_extracted(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def disp_extracted(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compute extracted nodal displacements only."""
-        return self.compute("disp_extracted", state=state, material=material, loads=loads, displacement=displacement, debug_mode=debug_mode)
+        return self.compute("disp_extracted", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
 
-    def mid_strain(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def mid_strain(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compute mid-surface strain field only."""
-        return self.compute("mid_strain", state=state, material=material, loads=loads, displacement=displacement, debug_mode=debug_mode)
+        return self.compute("mid_strain", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
 
-    def pnorm_stress(self, state=None, material=None, loads=None, displacement=None, debug_mode=False):
+    def pnorm_stress(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Compute the built-in p-norm stress output only."""
-        return self.compute("pnorm_stress", state=state, material=material, loads=loads, displacement=displacement, debug_mode=debug_mode)
+        return self.compute("pnorm_stress", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
 
     def _build_spec(self, name, context):
         if name not in self._registry:
@@ -738,11 +765,15 @@ class RMShellModel:
             )
         self.set_up_bcs(shell_bc_func, PENALTY_BC)
 
-        self._backend_cache = {}
-        self._ensure_backend("isotropic")
-        self.shell_pde = self._backend_cache["isotropic"]["shell_pde"]
-        self.fea = self._backend_cache["isotropic"]["solve_fea"]
+        self.shell_pde, self.fea = self._build_analysis_objects()
+        self._post_fea = None
         self.pp = self.post_processor
+
+    @property
+    def post_fea(self):
+        if self._post_fea is None:
+            self._post_fea = self._build_post_fea()
+        return self._post_fea
 
     def set_up_bcs(self, bc_locs_func, PENALTY_BC):
         if PENALTY_BC:
@@ -840,160 +871,7 @@ class RMShellModel:
             dolfinx.fem.dirichletbc(ubc, locate_BC2, W.sub(1)),
         ]
 
-    def _ensure_backend(self, backend_name):
-        if backend_name in self._backend_cache:
-            return self._backend_cache[backend_name]
-        if backend_name == "isotropic":
-            backend = self._build_isotropic_backend()
-        elif backend_name == "general_abd":
-            backend = self._build_abd_backend()
-        else:
-            raise ValueError(f"Unsupported backend '{backend_name}'.")
-        self._backend_cache[backend_name] = backend
-        return backend
-
-    def _build_isotropic_backend(self):
-        shell_pde = IsotropicShellPDE(
-            self.mesh,
-            element_wise_material=self.element_wise_material,
-            elementwise_pressure=self.elementwise_pressure,
-        )
-
-        solve_fea = FEA(self.mesh)
-        self._add_common_solver_settings(solve_fea)
-        solve_fea.recorder_path = os.path.join(self.recorder_path, "isotropic_solve")
-        os.makedirs(solve_fea.recorder_path, exist_ok=True)
-        self._add_strong_bcs(solve_fea, shell_pde)
-
-        h = Function(shell_pde.VT)
-        f = Function(shell_pde.VF)
-        m = Function(shell_pde.VF)
-        E = Function(shell_pde.VT)
-        nu = Function(shell_pde.VT)
-        density = Function(shell_pde.VT)
-        uhat = Function(shell_pde.VU)
-        w = Function(shell_pde.W)
-        g = Function(shell_pde.W)
-        with g.vector.localForm() as uloc:
-            uloc.set(0.0)
-
-        residual_form = shell_pde.pdeRes(
-            h=h, w=w, uhat=uhat, f=f, m=m, E=E, nu=nu,
-            penalty=self.PENALTY_BC, dss=self.dss, dSS=self.dSS, g=g,
-        )
-
-        solve_fea.add_input("thickness", h, init_val=0.001, record=self.record)
-        solve_fea.add_input("F_solid", f, init_val=1.0, record=self.record)
-        solve_fea.add_input("M_solid", m, init_val=1.0, record=self.record)
-        solve_fea.add_direct_vector_input(
-            "load_vector", shape=len(getFuncArray(w)), sign=-1.0, record=False,
-        )
-        solve_fea.add_input("E", E, init_val=1.0, record=self.record)
-        solve_fea.add_input("nu", nu, init_val=1.0, record=self.record)
-        solve_fea.add_input("density", density, init_val=1.0, record=self.record)
-        solve_fea.add_input("uhat", uhat, init_val=0.0, record=self.record)
-        solve_fea.add_state(
-            name="disp_solid",
-            function=w,
-            residual_form=residual_form,
-            arguments=["thickness", "F_solid", "M_solid", "load_vector", "E", "nu", "uhat"],
-            record=self.record,
-        )
-
-        post_fea = FEA(self.mesh)
-        post_fea.record = False
-        post_fea.recorder_path = os.path.join(self.recorder_path, "isotropic_post")
-        os.makedirs(post_fea.recorder_path, exist_ok=True)
-        disp_in = Function(shell_pde.W)
-        post_fea.add_input("disp_solid", disp_in, init_val=0.0, record=False)
-        post_fea.add_input("thickness", Function(shell_pde.VT), init_val=0.001, record=False)
-        post_fea.add_input("F_solid", Function(shell_pde.VF), init_val=1.0, record=False)
-        post_fea.add_input("M_solid", Function(shell_pde.VF), init_val=1.0, record=False)
-        post_fea.add_input("E", Function(shell_pde.VT), init_val=1.0, record=False)
-        post_fea.add_input("nu", Function(shell_pde.VT), init_val=1.0, record=False)
-        post_fea.add_input("density", Function(shell_pde.VT), init_val=1.0, record=False)
-        post_fea.add_input("uhat", Function(shell_pde.VU), init_val=0.0, record=False)
-
-        u_mid, theta = ufl.split(disp_in)
-        post_residual = shell_pde.pdeRes(
-            h=post_fea.inputs_dict["thickness"]["function"],
-            w=disp_in,
-            uhat=post_fea.inputs_dict["uhat"]["function"],
-            f=post_fea.inputs_dict["F_solid"]["function"],
-            m=post_fea.inputs_dict["M_solid"]["function"],
-            E=post_fea.inputs_dict["E"]["function"],
-            nu=post_fea.inputs_dict["nu"]["function"],
-            penalty=False,
-            dss=self.dss,
-            dSS=self.dSS,
-            g=g,
-        )
-        _ = post_residual
-        compliance_form = shell_pde.compliance(
-            u_mid,
-            theta,
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            post_fea.inputs_dict["F_solid"]["function"],
-            post_fea.inputs_dict["M_solid"]["function"],
-        )
-        cg_x_num_form, cg_y_num_form, cg_z_num_form, mass_form = shell_pde.cg_form(
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            post_fea.inputs_dict["density"]["function"],
-        )
-        elastic_energy_form = shell_pde.elastic_energy(
-            disp_in,
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            post_fea.inputs_dict["E"]["function"],
-        )
-        dx_reduced = ufl.Measure("dx", domain=self.mesh, metadata={"quadrature_degree": 4})
-        pnorm_stress_form = shell_pde.pnorm_stress(
-            disp_in,
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            post_fea.inputs_dict["E"]["function"],
-            post_fea.inputs_dict["nu"]["function"],
-            dx_reduced,
-            m=self.m,
-            rho=self.rho,
-            alpha=None,
-            regularization=False,
-        )
-        stress_form = shell_pde.von_Mises_stress(
-            disp_in,
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            post_fea.inputs_dict["E"]["function"],
-            post_fea.inputs_dict["nu"]["function"],
-            surface="Top",
-        )
-        mid_strain = shell_pde.elastic_model.eps
-        shear_strain = shell_pde.elastic_model.gamma
-        curvature = shell_pde.elastic_model.kappa
-        plane_strain_element = ufl.TensorElement("DG", self.mesh.ufl_cell(), degree=0, shape=(2, 2))
-        shear_strain_element = ufl.VectorElement("DG", self.mesh.ufl_cell(), degree=0, dim=2)
-        rotation_element = ufl.VectorElement("CG", self.mesh.ufl_cell(), degree=1, dim=3)
-        displacement_element = ufl.VectorElement("CG", self.mesh.ufl_cell(), degree=1, dim=3)
-
-        post_fea.add_output("compliance", compliance_form, ["disp_solid", "F_solid", "M_solid", "thickness", "uhat"])
-        post_fea.add_output("mass", mass_form, ["thickness", "density", "uhat"])
-        post_fea.add_output("cgx_num", cg_x_num_form, ["thickness", "density", "uhat"])
-        post_fea.add_output("cgy_num", cg_y_num_form, ["thickness", "density", "uhat"])
-        post_fea.add_output("cgz_num", cg_z_num_form, ["thickness", "density", "uhat"])
-        post_fea.add_output("elastic_energy", elastic_energy_form, ["thickness", "disp_solid", "E", "uhat"])
-        post_fea.add_output("pnorm_stress", pnorm_stress_form, ["thickness", "disp_solid", "E", "nu", "uhat"])
-        post_fea.add_field_output("stress", stress_form, ["thickness", "disp_solid", "E", "nu", "uhat"], element=("DG", 1), record=False, vtk=False)
-        post_fea.add_field_output("mid_strain", mid_strain, ["disp_solid", "uhat"], element=plane_strain_element, vtk=False, record=False)
-        post_fea.add_field_output("shear_strain", shear_strain, ["disp_solid", "uhat"], element=shear_strain_element, vtk=False, record=False)
-        post_fea.add_field_output("curvature", curvature, ["disp_solid", "uhat"], element=plane_strain_element, vtk=False, record=False)
-        post_fea.add_field_output("rotation", theta, ["disp_solid"], element=rotation_element, record=False, vtk=False)
-        post_fea.add_field_output("displacement", u_mid, ["disp_solid"], element=displacement_element, record=False, vtk=False)
-
-        return {"shell_pde": shell_pde, "solve_fea": solve_fea, "post_fea": post_fea}
-
-    def _build_abd_backend(self):
+    def _build_analysis_objects(self):
         shell_pde = CompositeShellPDE(
             self.mesh,
             element_wise_material=self.element_wise_material,
@@ -1054,6 +932,10 @@ class RMShellModel:
             record=self.record,
         )
 
+        return shell_pde, solve_fea
+
+    def _build_post_fea(self):
+        shell_pde = self.shell_pde
         post_fea = FEA(self.mesh)
         post_fea.record = False
         post_fea.recorder_path = os.path.join(self.recorder_path, "abd_post")
@@ -1067,25 +949,20 @@ class RMShellModel:
         post_fea.add_input("B", Function(shell_pde.VABD), init_val=1.0, record=False)
         post_fea.add_input("D", Function(shell_pde.VABD), init_val=1.0, record=False)
         post_fea.add_input("As", Function(shell_pde.VAs), init_val=1.0, record=False)
+        post_fea.add_input("E", Function(shell_pde.VT), init_val=1.0, record=False)
+        post_fea.add_input("nu", Function(shell_pde.VT), init_val=0.3, record=False)
         post_fea.add_input("density", Function(shell_pde.VT), init_val=1.0, record=False)
         post_fea.add_input("uhat", Function(shell_pde.VU), init_val=0.0, record=False)
 
         u_mid, theta = ufl.split(disp_in)
-        post_residual = shell_pde.pdeRes(
+        shell_pde.set_elastic_model(
             w=disp_in,
             uhat=post_fea.inputs_dict["uhat"]["function"],
-            f=post_fea.inputs_dict["F_solid"]["function"],
-            m=post_fea.inputs_dict["M_solid"]["function"],
             A=post_fea.inputs_dict["A"]["function"],
             B=post_fea.inputs_dict["B"]["function"],
             D=post_fea.inputs_dict["D"]["function"],
             As=post_fea.inputs_dict["As"]["function"],
-            penalty=False,
-            dss=self.dss,
-            dSS=self.dSS,
-            g=g,
         )
-        _ = post_residual
         compliance_form = shell_pde.compliance(
             u_mid,
             theta,
@@ -1105,6 +982,27 @@ class RMShellModel:
             post_fea.inputs_dict["thickness"]["function"],
             None,
         )
+        dx_reduced = ufl.Measure("dx", domain=self.mesh, metadata={"quadrature_degree": 4})
+        pnorm_stress_form = shell_pde.pnorm_stress(
+            disp_in,
+            post_fea.inputs_dict["uhat"]["function"],
+            post_fea.inputs_dict["thickness"]["function"],
+            post_fea.inputs_dict["E"]["function"],
+            post_fea.inputs_dict["nu"]["function"],
+            dx_reduced,
+            m=self.m,
+            rho=self.rho,
+            alpha=None,
+            regularization=False,
+        )
+        stress_form = shell_pde.von_Mises_stress(
+            disp_in,
+            post_fea.inputs_dict["uhat"]["function"],
+            post_fea.inputs_dict["thickness"]["function"],
+            post_fea.inputs_dict["E"]["function"],
+            post_fea.inputs_dict["nu"]["function"],
+            surface="Top",
+        )
         mid_strain = shell_pde.elastic_model.eps
         shear_strain = shell_pde.elastic_model.gamma
         curvature = shell_pde.elastic_model.kappa
@@ -1119,18 +1017,15 @@ class RMShellModel:
         post_fea.add_output("cgy_num", cg_y_num_form, ["thickness", "density", "uhat"])
         post_fea.add_output("cgz_num", cg_z_num_form, ["thickness", "density", "uhat"])
         post_fea.add_output("elastic_energy", elastic_energy_form, ["thickness", "disp_solid", "uhat"])
+        post_fea.add_output("pnorm_stress", pnorm_stress_form, ["thickness", "disp_solid", "E", "nu", "uhat"])
+        post_fea.add_field_output("stress", stress_form, ["thickness", "disp_solid", "E", "nu", "uhat"], element=("DG", 1), record=False, vtk=False)
         post_fea.add_field_output("mid_strain", mid_strain, ["disp_solid", "uhat"], element=plane_strain_element, vtk=False, record=False)
         post_fea.add_field_output("shear_strain", shear_strain, ["disp_solid", "uhat"], element=shear_strain_element, vtk=False, record=False)
         post_fea.add_field_output("curvature", curvature, ["disp_solid", "uhat"], element=plane_strain_element, vtk=False, record=False)
         post_fea.add_field_output("rotation", theta, ["disp_solid"], element=rotation_element, record=False, vtk=False)
         post_fea.add_field_output("displacement", u_mid, ["disp_solid"], element=displacement_element, record=False, vtk=False)
 
-        return {"shell_pde": shell_pde, "solve_fea": solve_fea, "post_fea": post_fea}
-
-    def _select_backend(self, material):
-        if getattr(material, "kind", None) == "general_abd":
-            return "general_abd"
-        return "isotropic"
+        return post_fea
 
     def _material_indices(self, shell_pde):
         if self.element_wise_material:
@@ -1142,8 +1037,8 @@ class RMShellModel:
             return self.mesh.topology.original_cell_index.tolist()
         return self.mesh.geometry.input_global_indices
 
-    def _prepare_common_load_inputs(self, backend, loads):
-        shell_pde = backend["shell_pde"]
+    def _prepare_common_load_inputs(self, loads, node_disp=None):
+        shell_pde = self.shell_pde
         pressure_mesh_indices = self._pressure_indices(shell_pde)
         deformation_mesh_indices = self.mesh.geometry.input_global_indices
 
@@ -1168,53 +1063,52 @@ class RMShellModel:
         elif reshaped_pressure is not None:
             shell_inputs.F_solid = reshaped_pressure
         else:
-            shell_inputs.F_solid = csdl.Variable(value=np.zeros(backend["solve_fea"].inputs_dict["F_solid"]["shape"]), name="F_solid_zero")
+            shell_inputs.F_solid = csdl.Variable(value=np.zeros(self.fea.inputs_dict["F_solid"]["shape"]), name="F_solid_zero")
         shell_inputs.F_solid.add_name("F_solid")
 
         if getattr(loads, "nodal_moments", None) is not None:
             shell_inputs.M_solid = csdl.reshape(loads.nodal_moments[pressure_mesh_indices], (-1,))
         else:
-            shell_inputs.M_solid = csdl.Variable(value=np.zeros(backend["solve_fea"].inputs_dict["M_solid"]["shape"]), name="M_solid_zero")
+            shell_inputs.M_solid = csdl.Variable(value=np.zeros(self.fea.inputs_dict["M_solid"]["shape"]), name="M_solid_zero")
         shell_inputs.M_solid.add_name("M_solid")
 
         if getattr(loads, "load_vector", None) is not None:
             shell_inputs.load_vector = loads.load_vector
         else:
-            shell_inputs.load_vector = csdl.Variable(value=np.zeros(backend["solve_fea"].inputs_dict["load_vector"]["shape"]), name="load_vector_zero")
+            shell_inputs.load_vector = csdl.Variable(value=np.zeros(self.fea.inputs_dict["load_vector"]["shape"]), name="load_vector_zero")
         shell_inputs.load_vector.add_name("load_vector")
 
-        if getattr(loads, "node_disp", None) is None:
+        node_disp = self._maybe_variable(node_disp, "node_disp")
+        if node_disp is None:
             node_disp = csdl.Variable(value=np.zeros((len(deformation_mesh_indices), 3)), name="node_disp")
-        else:
-            node_disp = loads.node_disp
         shell_inputs.uhat = node_disp[deformation_mesh_indices].reshape((-1,))
         shell_inputs.uhat.add_name("uhat")
         return shell_inputs
 
-    def _prepare_solver_inputs(self, material, loads, backend_name):
-        backend = self._ensure_backend(backend_name)
-        shell_inputs = self._prepare_common_load_inputs(backend, loads)
-        material_mesh_indices = self._material_indices(backend["shell_pde"])
+    def _prepare_solver_inputs(self, material, loads, node_disp=None):
+        shell_inputs = self._prepare_common_load_inputs(loads, node_disp=node_disp)
+        material_mesh_indices = self._material_indices(self.shell_pde)
 
         shell_inputs.thickness = material.thickness[material_mesh_indices]
         shell_inputs.density = material.density[material_mesh_indices]
-        if backend_name == "isotropic":
+        shell_inputs.A = material.A[material_mesh_indices]
+        shell_inputs.B = material.B[material_mesh_indices]
+        shell_inputs.D = material.D[material_mesh_indices]
+        shell_inputs.As = material.As[material_mesh_indices]
+        if getattr(material, "is_isotropic", False):
             shell_inputs.E = material.E[material_mesh_indices]
             shell_inputs.nu = material.nu[material_mesh_indices]
         else:
-            shell_inputs.A = material.A[material_mesh_indices]
-            shell_inputs.B = material.B[material_mesh_indices]
-            shell_inputs.D = material.D[material_mesh_indices]
-            shell_inputs.As = material.As[material_mesh_indices]
+            shell_inputs.E = csdl.Variable(value=np.ones(self.fea.inputs_dict["thickness"]["shape"]), name="E_unused")
+            shell_inputs.nu = csdl.Variable(value=np.full(self.fea.inputs_dict["thickness"]["shape"], 0.3), name="nu_unused")
         return shell_inputs
 
-    def solve(self, material, loads, debug_mode=False):
-        backend_name = self._select_backend(material)
-        backend = self._ensure_backend(backend_name)
-        shell_inputs = self._prepare_solver_inputs(material, loads, backend_name)
+    def solve(self, material, loads, node_disp=None, debug_mode=False):
+        node_disp = self._maybe_variable(node_disp, "node_disp")
+        shell_inputs = self._prepare_solver_inputs(material, loads, node_disp=node_disp)
 
         print("=" * 40)
-        F_solid_func = Function(backend["shell_pde"].VF)
+        F_solid_func = Function(self.shell_pde.VF)
         F_solid_func.x.array[:] = shell_inputs.F_solid.value
         print(
             "Total aero force projected to solid: {}".format(
@@ -1223,13 +1117,13 @@ class RMShellModel:
         )
         print("=" * 40)
         print("Solving the RM shell model ...")
-        raw_outputs = FEAModel(fea=[backend["solve_fea"]], fea_name="rm_shell").evaluate(shell_inputs, debug_mode=debug_mode)
+        raw_outputs = FEAModel(fea=[self.fea], fea_name="rm_shell").evaluate(shell_inputs, debug_mode=debug_mode)
         print("RM shell solve completed.")
         print("-" * 40)
         return ShellState(
-            backend_name=backend_name,
             material=material,
             loads=loads,
+            node_disp=node_disp,
             disp_solid=raw_outputs.disp_solid,
             uhat=shell_inputs.uhat,
             raw_outputs=raw_outputs,
@@ -1305,22 +1199,20 @@ class RMShellModel:
             nodal_forces=nodal_forces,
             nodal_pressure=nodal_pressure,
             nodal_moments=nodal_moments,
-            node_disp=node_disp,
         )
         vector_loads = None
         if load_vector is not None:
-            vector_loads = self.load_inputs.from_vector(load_vector=load_vector, node_disp=node_disp)
+            vector_loads = self.load_inputs.from_vector(load_vector=load_vector)
         loads = self.load_inputs.combine(field_loads, vector_loads)
-        state = self.solve(material=material, loads=loads, debug_mode=debug_mode)
+        state = self.solve(material=material, loads=loads, node_disp=node_disp, debug_mode=debug_mode)
         return self.post.evaluate(state=state, debug_mode=debug_mode)
 
     def assemble_generalized_load_vector(self, nodal_forces=None, nodal_pressure=None, nodal_moments=None, node_disp=None):
-        backend = self._ensure_backend("isotropic")
-        shell_pde = backend["shell_pde"]
+        shell_pde = self.shell_pde
         pressure_mesh_indices = self._pressure_indices(shell_pde)
         deformation_mesh_indices = self.mesh.geometry.input_global_indices
 
-        f_values = np.zeros(backend["solve_fea"].inputs_dict["F_solid"]["shape"])
+        f_values = np.zeros(self.fea.inputs_dict["F_solid"]["shape"])
         if nodal_forces is not None:
             reshaped_force = np.asarray(nodal_forces)[pressure_mesh_indices].reshape(-1)
             pressure_map = shell_pde.construct_force_to_pressure_map()
@@ -1328,11 +1220,11 @@ class RMShellModel:
         if nodal_pressure is not None:
             f_values += np.asarray(nodal_pressure)[pressure_mesh_indices].reshape(-1)
 
-        m_values = np.zeros(backend["solve_fea"].inputs_dict["M_solid"]["shape"])
+        m_values = np.zeros(self.fea.inputs_dict["M_solid"]["shape"])
         if nodal_moments is not None:
             m_values += np.asarray(nodal_moments)[pressure_mesh_indices].reshape(-1)
 
-        uhat_values = np.zeros(backend["solve_fea"].inputs_dict["uhat"]["shape"])
+        uhat_values = np.zeros(self.fea.inputs_dict["uhat"]["shape"])
         if node_disp is not None:
             uhat_values = np.asarray(node_disp)[deformation_mesh_indices].reshape(-1)
 
@@ -1352,7 +1244,8 @@ class AggregatedStressModel:
         self.rho = rho
 
     def evaluate(self, pnorm_stress: csdl.Variable):
-        return 1 / self.m * pnorm_stress ** (1 / self.rho)
+        regularized_pnorm = csdl.absolute(pnorm_stress, rho=50.0) + 1.0e-300
+        return 1 / self.m * regularized_pnorm ** (1 / self.rho)
 
 
 class DisplacementExtractionModel:

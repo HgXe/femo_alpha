@@ -1,6 +1,6 @@
 # RMShell Interface
 
-`RMShellModel` is the main shell analysis interface in FEMO. It now supports:
+`RMShellModel` is the main shell analysis interface in FEMO. It uses one `A`, `B`, `D`, and `As` shell formulation for both isotropic and directly supplied stiffness inputs, and supports:
 
 - isotropic material inputs through a high-level helper
 - general laminate-style shell inputs through direct `A`, `B`, `D`, and `As` matrices
@@ -38,10 +38,9 @@ material = shell.material_inputs.from_isotropic(
 loads = shell.load_inputs.from_fields(
     nodal_pressure=nodal_pressure,
     nodal_moments=nodal_moments,
-    node_disp=node_disp,
 )
 
-state = shell.solve(material=material, loads=loads)
+state = shell.solve(material=material, loads=loads, node_disp=node_disp)
 outputs = shell.post.evaluate(state=state)
 ```
 
@@ -73,7 +72,7 @@ material = shell.material_inputs.from_abd(
 )
 ```
 
-This general form is the common backend for what used to be split across `RMShellModel` and `RMShellModelComposite`.
+`from_isotropic(...)` converts `E`, `nu`, and `thickness` into `A`, `B`, `D`, and `As` matrices while preserving `E` and `nu` for isotropic stress recovery. `from_abd(...)` supplies those stiffness matrices directly, but isotropic stress outputs are only available when the material was built with `from_isotropic(...)`.
 
 ## Load Inputs
 
@@ -84,7 +83,6 @@ loads = shell.load_inputs.from_fields(
     nodal_forces=nodal_forces,
     nodal_pressure=nodal_pressure,
     nodal_moments=nodal_moments,
-    node_disp=node_disp,
 )
 ```
 
@@ -93,7 +91,6 @@ Direct generalized load vectors:
 ```python
 loads = shell.load_inputs.from_vector(
     load_vector=load_vector,
-    node_disp=node_disp,
 )
 ```
 
@@ -103,28 +100,32 @@ Combined loads:
 field_loads = shell.load_inputs.from_fields(
     nodal_pressure=nodal_pressure,
     nodal_moments=nodal_moments,
-    node_disp=node_disp,
 )
 vector_loads = shell.load_inputs.from_vector(
     load_vector=load_vector,
-    node_disp=node_disp,
 )
 loads = shell.load_inputs.combine(field_loads, vector_loads)
 ```
 
 If an upstream transfer already provides the generalized shell right-hand side, the direct-vector path avoids reconstructing and projecting load fields.
 
+Mesh deformation is not part of the load group. Pass it directly to the solve or postprocessing call:
+
+```python
+state = shell.solve(material=material, loads=loads, node_disp=node_disp)
+outputs = shell.post.evaluate(state=state)
+```
+
 ## Solving
 
 `solve(...)` returns a `ShellState` that stores:
 
-- the selected backend
 - the material and load input groups
 - the solved shell displacement variable
 - the raw FEA output bundle
 
 ```python
-state = shell.solve(material=material, loads=loads)
+state = shell.solve(material=material, loads=loads, node_disp=node_disp)
 disp = state.disp_solid
 ```
 
@@ -160,6 +161,17 @@ context = shell.post.context(state=state)
 mass = shell.post.compute("mass", context=context)
 stress = shell.post.compute("pnorm_stress", context=context)
 ```
+
+Stress outputs for isotropic materials:
+
+```python
+pnorm = shell.post.compute("pnorm_stress", state=state)
+top_stress = shell.post.compute("stress", state=state)
+mid_stress = shell.post.compute("stress_mid", state=state)
+bottom_stress = shell.post.compute("stress_bottom", state=state)
+```
+
+`stress` is the top-surface von Mises field. The explicit `stress_top`, `stress_mid`, and `stress_bottom` names are available when a workflow needs to choose the through-thickness recovery surface.
 
 Postprocessing with an external displacement:
 

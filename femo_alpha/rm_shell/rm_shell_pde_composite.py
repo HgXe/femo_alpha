@@ -52,10 +52,14 @@ class RMShellPDE:
                 form(TestFunction(self.VF.sub(0).collapse()[0])*dx)).getArray()
         # self.bf_sup_sizes = np.ones_like(self.bf_sup_sizes)
 
-    def pdeRes(self, w, uhat, f, m, A, B, D, As, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
+    def set_elastic_model(self, w, uhat, A, B, D, As):
         material_model = MaterialModelComposite2(A, B, D, As)
         self.elastic_model = elastic_model = ElasticModelShapeOpt(self.mesh,
                                                 w, uhat, material_model.CLT)
+        return elastic_model
+
+    def pdeRes(self, w, uhat, f, m, A, B, D, As, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
+        elastic_model = self.set_elastic_model(w, uhat, A, B, D, As)
         elastic_energy = elastic_model.elasticEnergy(
                             dx_inplane=self.dx_inplane,
                             dx_shear=self.dx_shear

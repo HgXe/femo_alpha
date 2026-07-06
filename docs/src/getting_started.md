@@ -93,10 +93,9 @@ material = shell.material_inputs.from_isotropic(
 
 loads = shell.load_inputs.from_fields(
     nodal_pressure=nodal_pressure,
-    node_disp=node_disp,
 )
 
-state = shell.solve(material=material, loads=loads)
+state = shell.solve(material=material, loads=loads, node_disp=node_disp)
 outputs = shell.post.evaluate(state=state)
 ```
 
@@ -105,9 +104,8 @@ Direct generalized shell load vectors are also supported:
 ```python
 loads = shell.load_inputs.from_vector(
     load_vector=load_vector,
-    node_disp=node_disp,
 )
-state = shell.solve(material=material, loads=loads)
+state = shell.solve(material=material, loads=loads, node_disp=node_disp)
 ```
 
 For a fuller walkthrough, including postprocessing and custom outputs, see the RMShell tutorial and interface reference.

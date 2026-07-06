@@ -130,8 +130,7 @@ def _assemble_combined_load_direction(shell_model, force_direction, moment_direc
 
 
 def _assembled_compliance_from_current_fea(shell_model):
-    fea = shell_model._ensure_backend("isotropic")["post_fea"]
-    return assemble_scalar(form(fea.outputs_dict["compliance"]["form"]))
+    return assemble_scalar(form(shell_model.post_fea.outputs_dict["compliance"]["form"]))
 
 
 def _expected_compliance_from_load_vector(load_vector, disp_solid):
@@ -150,7 +149,6 @@ def _build_isotropic_material(shell_model, vals, suffix):
 def _build_field_loads(shell_model, vals, suffix, include_moments=False):
     kwargs = {
         "nodal_pressure": csdl.Variable(value=vals["nodal_pressure"], name=f"nodal_pressure_{suffix}"),
-        "node_disp": csdl.Variable(value=vals["node_disp"], name=f"node_disp_{suffix}"),
     }
     if include_moments:
         kwargs["nodal_moments"] = csdl.Variable(value=vals["nodal_moments"], name=f"nodal_moments_{suffix}")
@@ -160,8 +158,32 @@ def _build_field_loads(shell_model, vals, suffix, include_moments=False):
 def _build_vector_loads(shell_model, vals, suffix):
     return shell_model.load_inputs.from_vector(
         load_vector=csdl.Variable(value=vals["load_vector"], name=f"direct_load_vector_{suffix}"),
-        node_disp=csdl.Variable(value=vals["node_disp"], name=f"node_disp_vector_{suffix}"),
     )
+
+
+def _build_node_disp(vals, suffix):
+    return csdl.Variable(value=vals["node_disp"], name=f"node_disp_{suffix}")
+
+
+def test_rmshell_solve_does_not_build_postprocessor_outputs():
+    shell_model = _build_shell_model(
+        str(RECORDS_ROOT / "rmshell_solve_only"),
+    )
+    vals = _fenics_ordered_inputs(shell_model)
+
+    recorder = csdl.Recorder(inline=True)
+    recorder.start()
+
+    material = _build_isotropic_material(shell_model, vals, "solve_only")
+    loads = _build_field_loads(shell_model, vals, "solve_only")
+    state = shell_model.solve(material, loads, node_disp=_build_node_disp(vals, "solve_only"))
+
+    assert shell_model._post_fea is None
+    assert state.disp_solid is not None
+
+    outputs = shell_model.post.evaluate(state=state)
+    assert shell_model._post_fea is not None
+    assert outputs.compliance is not None
 
 
 def test_rmshell_direct_load_vector_matches_field_loads_and_derivatives():
@@ -183,9 +205,9 @@ def test_rmshell_direct_load_vector_matches_field_loads_and_derivatives():
     field_loads = _build_field_loads(field_shell, field_vals, "field")
     direct_loads = _build_vector_loads(direct_shell, direct_vals, "direct")
 
-    field_state = field_shell.solve(field_material, field_loads)
+    field_state = field_shell.solve(field_material, field_loads, node_disp=_build_node_disp(field_vals, "field"))
     field_outputs = field_shell.post.evaluate(state=field_state)
-    direct_state = direct_shell.solve(direct_material, direct_loads)
+    direct_state = direct_shell.solve(direct_material, direct_loads, node_disp=_build_node_disp(direct_vals, "direct"))
     direct_outputs = direct_shell.post.evaluate(state=direct_state)
 
     np.testing.assert_allclose(
@@ -255,8 +277,12 @@ def test_rmshell_direct_load_vector_matches_combined_force_and_moment_loads():
     field_loads = _build_field_loads(field_shell, vals, "field_fm", include_moments=True)
     direct_loads = _build_vector_loads(direct_shell, direct_vals, "direct_fm")
 
-    field_outputs = field_shell.post.evaluate(state=field_shell.solve(field_material, field_loads))
-    direct_outputs = direct_shell.post.evaluate(state=direct_shell.solve(direct_material, direct_loads))
+    field_outputs = field_shell.post.evaluate(
+        state=field_shell.solve(field_material, field_loads, node_disp=_build_node_disp(vals, "field_fm"))
+    )
+    direct_outputs = direct_shell.post.evaluate(
+        state=direct_shell.solve(direct_material, direct_loads, node_disp=_build_node_disp(direct_vals, "direct_fm"))
+    )
 
     np.testing.assert_allclose(
         direct_outputs.disp_solid.value,
@@ -330,7 +356,7 @@ def test_rmshell_uniform_pressure_matches_cantilever_beam_tip_deflection():
 
     material = _build_isotropic_material(shell_model, vals, "tb")
     loads = _build_field_loads(shell_model, vals, "tb")
-    outputs = shell_model.post.evaluate(state=shell_model.solve(material, loads))
+    outputs = shell_model.post.evaluate(state=shell_model.solve(material, loads, node_disp=_build_node_disp(vals, "tb")))
 
     tip_deflection_fe = np.max(outputs.disp_extracted.value[:, 2])
     length = 10.0
@@ -365,7 +391,7 @@ def test_rmshell_compliance_matches_assembled_output_form():
 
     material = _build_isotropic_material(shell_model, vals, "comp")
     loads = _build_field_loads(shell_model, vals, "comp")
-    state = shell_model.solve(material, loads)
+    state = shell_model.solve(material, loads, node_disp=_build_node_disp(vals, "comp"))
     outputs = shell_model.post.evaluate(state=state)
 
     assembled_field_compliance = _assembled_compliance_from_current_fea(shell_model)
@@ -413,7 +439,9 @@ def test_rmshell_compliance_matches_total_work_for_direct_and_mixed_loads():
 
     direct_material = _build_isotropic_material(direct_shell, direct_vals, "comp_mix_direct")
     direct_loads = _build_vector_loads(direct_shell, direct_vals, "comp_mix_direct")
-    direct_outputs = direct_shell.post.evaluate(state=direct_shell.solve(direct_material, direct_loads))
+    direct_outputs = direct_shell.post.evaluate(
+        state=direct_shell.solve(direct_material, direct_loads, node_disp=_build_node_disp(direct_vals, "comp_mix_direct"))
+    )
 
     expected_direct_compliance = _expected_compliance_from_load_vector(
         direct_vals["load_vector"],
@@ -430,10 +458,11 @@ def test_rmshell_compliance_matches_total_work_for_direct_and_mixed_loads():
     mixed_field_loads = _build_field_loads(mixed_shell, mixed_vals, "comp_mix_mixed", include_moments=True)
     mixed_direct_loads = mixed_shell.load_inputs.from_vector(
         load_vector=csdl.Variable(value=extra_direct, name="mixed_direct_load_vector"),
-        node_disp=csdl.Variable(value=mixed_vals["node_disp"], name="node_disp_comp_mix"),
     )
     mixed_loads = mixed_shell.load_inputs.combine(mixed_field_loads, mixed_direct_loads)
-    mixed_outputs = mixed_shell.post.evaluate(state=mixed_shell.solve(mixed_material, mixed_loads))
+    mixed_outputs = mixed_shell.post.evaluate(
+        state=mixed_shell.solve(mixed_material, mixed_loads, node_disp=_build_node_disp(mixed_vals, "comp_mix_mixed"))
+    )
 
     total_load_vector = mixed_vals["load_vector"] + extra_direct
     expected_mixed_compliance = _expected_compliance_from_load_vector(
@@ -463,12 +492,13 @@ def test_rmshell_post_evaluate_matches_solved_state_for_external_displacement():
 
     material = _build_isotropic_material(shell_model, vals, "external")
     loads = _build_field_loads(shell_model, vals, "external", include_moments=True)
-    state = shell_model.solve(material, loads)
+    state = shell_model.solve(material, loads, node_disp=_build_node_disp(vals, "external"))
     solved_outputs = shell_model.post.evaluate(state=state)
     external_outputs = shell_model.post.evaluate(
         material=material,
         loads=loads,
         displacement=state.disp_solid,
+        node_disp=_build_node_disp(vals, "external_post"),
     )
 
     np.testing.assert_allclose(
@@ -500,7 +530,7 @@ def test_rmshell_legacy_evaluate_matches_solve_and_post_evaluate():
 
     material = _build_isotropic_material(shell_model, vals, "legacy")
     loads = _build_field_loads(shell_model, vals, "legacy")
-    outputs_new = shell_model.post.evaluate(state=shell_model.solve(material, loads))
+    outputs_new = shell_model.post.evaluate(state=shell_model.solve(material, loads, node_disp=_build_node_disp(vals, "legacy")))
 
     outputs_old = shell_model.evaluate(
         vals["nodal_pressure"],
@@ -541,7 +571,7 @@ def test_rmshell_post_registry_supports_groups_and_custom_outputs():
 
     material = _build_isotropic_material(shell_model, vals, "registry")
     loads = _build_field_loads(shell_model, vals, "registry")
-    state = shell_model.solve(material, loads)
+    state = shell_model.solve(material, loads, node_disp=_build_node_disp(vals, "registry"))
 
     mass_props = shell_model.post.mass_properties(state=state)
     np.testing.assert_allclose(
@@ -580,8 +610,21 @@ def test_rmshell_post_registry_supports_groups_and_custom_outputs():
         ["avg_eps_x", "custom_pnorm", "pnorm_stress"],
         state=state,
     )
+    stress_outputs = shell_model.post.compute_many(
+        ["stress", "stress_top", "stress_mid", "stress_bottom"],
+        state=state,
+    )
 
     assert custom_outputs.avg_eps_x.shape == (1,)
+    assert stress_outputs.stress.shape == stress_outputs.stress_top.shape
+    assert stress_outputs.stress_mid.shape == stress_outputs.stress.shape
+    assert stress_outputs.stress_bottom.shape == stress_outputs.stress.shape
+    np.testing.assert_allclose(
+        stress_outputs.stress.value,
+        stress_outputs.stress_top.value,
+        rtol=1e-12,
+        atol=1e-12,
+    )
     np.testing.assert_allclose(
         custom_outputs.custom_pnorm.value,
         custom_outputs.pnorm_stress.value,
