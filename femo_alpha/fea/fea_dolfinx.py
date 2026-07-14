@@ -147,7 +147,8 @@ class FEA(object):
             arguments=arguments,
             partials=partials,
             recorder=self.createRecorder(name, record, vtk=vtk),
-            record=record
+            record=record,
+            vtk=vtk,
         )
 
     def add_exact_solution(self, Expression, function_space):

@@ -10,7 +10,6 @@ meshio = pytest.importorskip("meshio")
 import csdl_alpha as csdl
 from mpi4py import MPI
 from dolfinx.fem import Function
-from dolfinx.fem import assemble_scalar, form
 
 from femo_alpha.rm_shell.rm_shell_model import RMShellModel
 
@@ -45,13 +44,13 @@ def _build_surface_mesh(nx=4, ny=2):
         return xdmf.read_mesh(name="Grid")
 
 
-def _build_shell_model(recorder_path, nx=4, ny=2):
+def _build_shell_model(recorder_path, nx=4, ny=2, record=True):
     mesh = _build_surface_mesh(nx=nx, ny=ny)
     return RMShellModel(
         mesh,
         shell_bc_func=_clamped_boundary,
         element_wise_material=False,
-        record=True,
+        record=record,
         solve_direct=True,
         recorder_path=recorder_path,
     )
@@ -127,10 +126,6 @@ def _assemble_combined_load_direction(shell_model, force_direction, moment_direc
         f=f_func,
         m=m_func,
     )
-
-
-def _assembled_compliance_from_current_fea(shell_model):
-    return assemble_scalar(form(shell_model.post_fea.outputs_dict["compliance"]["form"]))
 
 
 def _expected_compliance_from_load_vector(load_vector, disp_solid):
@@ -258,6 +253,41 @@ def test_rmshell_direct_load_vector_matches_field_loads_and_derivatives():
     recorder.stop()
 
 
+def test_rmshell_post_field_recording_defaults_and_overrides():
+    shell_recording = _build_shell_model(
+        str(RECORDS_ROOT / "rmshell_post_recording_default"),
+        nx=2,
+        ny=1,
+        record=True,
+    )
+    assert shell_recording.post_fea.outputs_dict == {}
+    assert shell_recording.post_fea.outputs_field_dict == {}
+    shell_recording.post.clear().strains().kinematics().stress()
+    for output in shell_recording.post._outputs:
+        if hasattr(output, "record"):
+            assert output.record is True
+
+    shell_quiet = _build_shell_model(
+        str(RECORDS_ROOT / "rmshell_post_recording_quiet"),
+        nx=2,
+        ny=1,
+        record=False,
+    )
+    shell_quiet.post.clear().strains().kinematics().stress()
+    for output in shell_quiet.post._outputs:
+        if hasattr(output, "record"):
+            assert output.record is False
+
+    shell_quiet.post.add_field_form(
+        "quiet_override",
+        lambda context: context.post._displacement_components(context)[0],
+        ["disp_solid"],
+        element=("DG", 0),
+        record=True,
+    )
+    assert shell_quiet.post._outputs[-1].record is True
+
+
 def test_rmshell_direct_load_vector_matches_combined_force_and_moment_loads():
     field_shell = _build_shell_model(
         str(RECORDS_ROOT / "rmshell_field_force_moment"),
@@ -378,7 +408,7 @@ def test_rmshell_uniform_pressure_matches_cantilever_beam_tip_deflection():
     recorder.stop()
 
 
-def test_rmshell_compliance_matches_assembled_output_form():
+def test_rmshell_compliance_matches_generalized_load_work():
     shell_model = _build_shell_model(
         str(RECORDS_ROOT / "rmshell_compliance_check"),
         nx=4,
@@ -394,18 +424,11 @@ def test_rmshell_compliance_matches_assembled_output_form():
     state = shell_model.solve(material, loads, node_disp=_build_node_disp(vals, "comp"))
     outputs = shell_model.post.evaluate(state=state)
 
-    assembled_field_compliance = _assembled_compliance_from_current_fea(shell_model)
     expected_field_compliance = _expected_compliance_from_load_vector(
         vals["load_vector"],
         outputs.disp_solid.value,
     )
 
-    np.testing.assert_allclose(
-        assembled_field_compliance,
-        expected_field_compliance,
-        rtol=1e-10,
-        atol=1e-10,
-    )
     np.testing.assert_allclose(
         outputs.compliance.value,
         expected_field_compliance,
@@ -573,61 +596,40 @@ def test_rmshell_post_registry_supports_groups_and_custom_outputs():
     loads = _build_field_loads(shell_model, vals, "registry")
     state = shell_model.solve(material, loads, node_disp=_build_node_disp(vals, "registry"))
 
-    mass_props = shell_model.post.mass_properties(state=state)
-    np.testing.assert_allclose(
-        mass_props.cg.value,
-        shell_model.post.cg(state=state).value,
-        rtol=1e-12,
-        atol=1e-12,
-    )
-    np.testing.assert_allclose(
-        mass_props.mass.value,
-        shell_model.post.mass(state=state).value,
-        rtol=1e-12,
-        atol=1e-12,
-    )
+    assert shell_model.post._outputs == []
+    with pytest.raises(ValueError, match="No RMShell postprocessing outputs"):
+        shell_model.post.compute(state=state)
 
-    shell_model.post.add_output(
+    shell_model.post.mass_properties().average_strain(
         "avg_eps_x",
-        shell_model.post.builders.average_strain(
-            strain_type="mid",
-            component="xx",
-            region=None,
-        ),
-        docstring="Average mid-surface eps_x over the full shell.",
+        strain_type="mid",
+        component="xx",
+        region=None,
     )
-    shell_model.post.add_output(
+    shell_model.post.pnorm_stress_custom(
         "custom_pnorm",
-        shell_model.post.builders.pnorm_stress(
-            rho=shell_model.rho,
-            m=shell_model.m,
-            region=None,
-        ),
-        docstring="Custom registered p-norm stress output.",
-    )
+        rho=shell_model.rho,
+        m=shell_model.m,
+        region=None,
+    ).pnorm_stress().stress().stress_top().stress_mid().stress_bottom()
 
-    custom_outputs = shell_model.post.compute_many(
-        ["avg_eps_x", "custom_pnorm", "pnorm_stress"],
-        state=state,
-    )
-    stress_outputs = shell_model.post.compute_many(
-        ["stress", "stress_top", "stress_mid", "stress_bottom"],
-        state=state,
-    )
+    outputs = shell_model.post.compute(state=state)
 
-    assert custom_outputs.avg_eps_x.shape == (1,)
-    assert stress_outputs.stress.shape == stress_outputs.stress_top.shape
-    assert stress_outputs.stress_mid.shape == stress_outputs.stress.shape
-    assert stress_outputs.stress_bottom.shape == stress_outputs.stress.shape
+    assert outputs.avg_eps_x.shape == (1,)
+    assert outputs.stress.shape == outputs.stress_top.shape
+    assert outputs.stress_mid.shape == outputs.stress.shape
+    assert outputs.stress_bottom.shape == outputs.stress.shape
+    assert not hasattr(outputs, "elastic_energy")
+    assert outputs.cg.shape == (3,)
     np.testing.assert_allclose(
-        stress_outputs.stress.value,
-        stress_outputs.stress_top.value,
+        outputs.stress.value,
+        outputs.stress_top.value,
         rtol=1e-12,
         atol=1e-12,
     )
     np.testing.assert_allclose(
-        custom_outputs.custom_pnorm.value,
-        custom_outputs.pnorm_stress.value,
+        outputs.custom_pnorm.value,
+        outputs.pnorm_stress.value,
         rtol=1e-10,
         atol=1e-10,
     )

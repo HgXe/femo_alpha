@@ -96,7 +96,11 @@ loads = shell.load_inputs.from_fields(
 )
 
 state = shell.solve(material=material, loads=loads, node_disp=node_disp)
-outputs = shell.post.evaluate(state=state)
+outputs = (
+    shell.post.clear()
+    .add_default_outputs()
+    .compute(state=state)
+)
 ```
 
 Direct generalized shell load vectors are also supported:

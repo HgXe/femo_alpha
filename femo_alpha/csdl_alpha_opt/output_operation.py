@@ -136,6 +136,7 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
 
         # record the function values in XDMF files
         if self.fea_output['record']:
+            self.fea.opt_iter += 1
             self.fea_output['recorder'].write_function(
                 self.fea_output['function'], self.fea.opt_iter
             )
@@ -224,4 +225,3 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
             "OutputFieldOperation uses compute_jacvec_product for derivatives. "
             "Full Jacobian assembly is intentionally disabled for field outputs."
         )
-

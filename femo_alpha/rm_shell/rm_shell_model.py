@@ -143,14 +143,87 @@ class LoadInputFactory:
         return combined
 
 
-class PostOutputSpec:
-    """Specification for one postprocessing output."""
+class ScalarFormOutput:
+    """Postprocessing output assembled from one scalar UFL form."""
 
-    def __init__(self, name, kind, docstring=None, **metadata):
+    def __init__(self, name, form_fn, arguments):
         self.name = name
-        self.kind = kind
-        self.docstring = docstring
-        self.metadata = metadata
+        self.form_fn = form_fn
+        self.arguments = arguments
+
+    def collect_forms(self, context, scalar_forms, field_forms):
+        scalar_forms[self.name] = (self.form_fn(context), self.arguments)
+
+    def finalize(self, context, form_outputs, outputs):
+        setattr(outputs, self.name, form_outputs[self.name])
+
+
+class FieldFormOutput:
+    """Postprocessing output projected from one UFL field form."""
+
+    def __init__(self, name, form_fn, arguments, element, reorder=None, record=None, vtk=False):
+        self.name = name
+        self.form_fn = form_fn
+        self.arguments = arguments
+        self.element = element
+        self.reorder = reorder
+        self.record = record
+        self.vtk = vtk
+
+    def collect_forms(self, context, scalar_forms, field_forms):
+        field_forms[self.name] = (
+            self.form_fn(context),
+            self.arguments,
+            self.element,
+            self.reorder,
+            self.record,
+            self.vtk,
+        )
+
+    def finalize(self, context, form_outputs, outputs):
+        setattr(outputs, self.name, form_outputs[self.name])
+
+
+class RatioFormOutput:
+    """Postprocessing output computed as the ratio of two scalar forms."""
+
+    def __init__(self, name, numerator_fn, numerator_arguments, denominator_fn, denominator_arguments):
+        self.name = name
+        self.numerator_name = f"__{name}_numerator"
+        self.denominator_name = f"__{name}_denominator"
+        self.numerator_fn = numerator_fn
+        self.numerator_arguments = numerator_arguments
+        self.denominator_fn = denominator_fn
+        self.denominator_arguments = denominator_arguments
+
+    def collect_forms(self, context, scalar_forms, field_forms):
+        scalar_forms[self.numerator_name] = (self.numerator_fn(context), self.numerator_arguments)
+        scalar_forms[self.denominator_name] = (self.denominator_fn(context), self.denominator_arguments)
+
+    def finalize(self, context, form_outputs, outputs):
+        setattr(outputs, self.name, form_outputs[self.numerator_name] / form_outputs[self.denominator_name])
+
+
+class CSDLOutput:
+    """Postprocessing output computed from CSDL operations after form assembly."""
+
+    def __init__(self, name, compute_fn, dependencies=()):
+        self.name = name
+        self.compute_fn = compute_fn
+        self.dependencies = tuple(dependencies)
+
+    def collect_forms(self, context, scalar_forms, field_forms):
+        for dependency in self.dependencies:
+            dependency.collect_forms(context, scalar_forms, field_forms)
+
+    def finalize(self, context, form_outputs, outputs):
+        for dependency in self.dependencies:
+            if not hasattr(outputs, dependency.name):
+                dependency.finalize(context, form_outputs, outputs)
+        value = self.compute_fn(context, form_outputs, outputs)
+        if hasattr(value, "add_name"):
+            value.add_name(self.name)
+        setattr(outputs, self.name, value)
 
 
 class ShellPostContext:
@@ -173,7 +246,6 @@ class ShellPostContext:
         self.node_disp = node_disp
         self.displacement = displacement
         self.debug_mode = debug_mode
-        self._cache = {}
         self._post_inputs = None
 
     @property
@@ -221,17 +293,13 @@ class ShellPostContext:
             self.region_measure(region),
         )
 
-    def compute(self, name):
-        """Compute one registered postprocessing output."""
-        return self.post.compute(name, context=self)
-
-    def compute_many(self, names):
-        """Compute multiple registered postprocessing outputs."""
-        return self.post.compute_many(names, context=self)
+    def compute(self):
+        """Compute the outputs currently requested on the postprocessor."""
+        return self.post.compute(context=self)
 
 
-class ShellPostBuilderFactory:
-    """Factory for common region-aware postprocessing output builders."""
+class ShellPostProcessor:
+    """Request-and-compute shell postprocessing interface."""
 
     _STRAIN_COMPONENTS = {
         "xx": (0, 0),
@@ -240,175 +308,89 @@ class ShellPostBuilderFactory:
         "yx": (1, 0),
     }
 
-    def scalar_form(self, form_fn, arguments, docstring=None):
-        """Create a scalar-output builder from a UFL form callback."""
-
-        def builder(context):
-            return PostOutputSpec(
-                name="",
-                kind="scalar_form_builder",
-                docstring=docstring,
-                form=form_fn(context),
-                arguments=arguments,
-            )
-
-        return builder
-
-    def field_form(self, form_fn, arguments, element, reorder=None, docstring=None):
-        """Create a field-output builder from a UFL form callback."""
-
-        def builder(context):
-            return PostOutputSpec(
-                name="",
-                kind="field_form_builder",
-                docstring=docstring,
-                form=form_fn(context),
-                arguments=arguments,
-                element=element,
-                reorder=reorder,
-            )
-
-        return builder
-
-    def average_strain(self, strain_type="mid", component="xx", region=None):
-        """Create a builder for average strain over a tagged region."""
-        if component not in self._STRAIN_COMPONENTS:
-            raise ValueError(f"Unsupported strain component '{component}'.")
-
-        def builder(context):
-            if strain_type == "mid":
-                strain_form = context.shell_pde.elastic_model.eps
-            elif strain_type == "curvature":
-                strain_form = context.shell_pde.elastic_model.kappa
-            else:
-                raise ValueError(f"Unsupported strain_type '{strain_type}'.")
-            i, j = self._STRAIN_COMPONENTS[component]
-            measure = context.region_measure(region)
-            area_form = context.area_form(region)
-            avg_form = strain_form[i, j] * ufl.as_ufl(1.0) * measure
-            return PostOutputSpec(
-                name="",
-                kind="derived_from_forms",
-                numerator=PostOutputSpec(
-                    name="",
-                    kind="scalar_form_builder",
-                    form=avg_form,
-                    arguments=["disp_solid", "uhat"],
-                ),
-                denominator=PostOutputSpec(
-                    name="",
-                    kind="scalar_form_builder",
-                    form=area_form,
-                    arguments=["uhat"],
-                ),
-            )
-
-        return builder
-
-    def pnorm_stress(self, rho=100, m=1e-6, region=None, surface="top"):
-        """Create a builder for region-restricted p-norm von Mises stress."""
-
-        def builder(context):
-            if not getattr(context.material, "is_isotropic", False):
-                raise ValueError("pnorm_stress requires material created with from_isotropic(...).")
-            post_fea = context.post_fea
-            dx_measure = ufl.Measure("dx", domain=context.shell_model.mesh, metadata={"quadrature_degree": 4})
-            if region is not None:
-                dx_measure = context.region_measure(region)
-            pnorm_form = context.shell_pde.pnorm_stress(
-                post_fea.inputs_dict["disp_solid"]["function"],
-                post_fea.inputs_dict["uhat"]["function"],
-                post_fea.inputs_dict["thickness"]["function"],
-                post_fea.inputs_dict["E"]["function"],
-                post_fea.inputs_dict["nu"]["function"],
-                dx_measure,
-                m=m,
-                rho=rho,
-                alpha=None,
-                regularization=False,
-            )
-            return PostOutputSpec(
-                name="",
-                kind="scalar_form_builder",
-                form=pnorm_form,
-                arguments=["disp_solid", "thickness", "E", "nu", "uhat"],
-            )
-
-        return builder
-
-    def von_mises_stress(self, surface="top"):
-        """Create a projected von Mises stress field builder for isotropic materials."""
-        surface_map = {"top": "Top", "mid": "Mid", "middle": "Mid", "bottom": "Bot", "bot": "Bot"}
-        surface_key = surface.lower()
-        if surface_key not in surface_map:
-            raise ValueError("surface must be one of 'top', 'mid', or 'bottom'.")
-        pde_surface = surface_map[surface_key]
-
-        def builder(context):
-            if not getattr(context.material, "is_isotropic", False):
-                raise ValueError("von_mises_stress requires material created with from_isotropic(...).")
-            post_fea = context.post_fea
-            stress_form = context.shell_pde.von_Mises_stress(
-                post_fea.inputs_dict["disp_solid"]["function"],
-                post_fea.inputs_dict["uhat"]["function"],
-                post_fea.inputs_dict["thickness"]["function"],
-                post_fea.inputs_dict["E"]["function"],
-                post_fea.inputs_dict["nu"]["function"],
-                surface=pde_surface,
-            )
-            return PostOutputSpec(
-                name="",
-                kind="field_form_builder",
-                form=stress_form,
-                arguments=["thickness", "disp_solid", "E", "nu", "uhat"],
-                element=("DG", 1),
-            )
-
-        return builder
-
-
-class ShellPostProcessor:
-    """Registry-driven shell postprocessing interface."""
-
-    DEFAULT_OUTPUTS = (
-        "compliance",
-        "mass",
-        "cg",
-        "elastic_energy",
-        "disp_extracted",
-        "displacements",
-        "rotations",
-        "aggregated_stress",
-    )
-
     def __init__(self, shell_model):
         self.shell_model = shell_model
-        self.builders = ShellPostBuilderFactory()
-        self._registry = {}
-        self._register_builtin_outputs()
+        self._outputs = []
+        self._record_file_counter = 0
 
-    def _register_builtin_outputs(self):
-        self._registry["compliance"] = PostOutputSpec("compliance", "derived_builtin")
-        self._registry["mass"] = PostOutputSpec("mass", "scalar_fea_output")
-        self._registry["cgx_num"] = PostOutputSpec("cgx_num", "scalar_fea_output")
-        self._registry["cgy_num"] = PostOutputSpec("cgy_num", "scalar_fea_output")
-        self._registry["cgz_num"] = PostOutputSpec("cgz_num", "scalar_fea_output")
-        self._registry["elastic_energy"] = PostOutputSpec("elastic_energy", "scalar_fea_output")
-        self._registry["pnorm_stress"] = PostOutputSpec("pnorm_stress", "custom_builder", builder=self.builders.pnorm_stress())
-        self._registry["stress"] = PostOutputSpec("stress", "custom_builder", builder=self.builders.von_mises_stress("top"))
-        self._registry["stress_top"] = PostOutputSpec("stress_top", "custom_builder", builder=self.builders.von_mises_stress("top"))
-        self._registry["stress_mid"] = PostOutputSpec("stress_mid", "custom_builder", builder=self.builders.von_mises_stress("mid"))
-        self._registry["stress_bottom"] = PostOutputSpec("stress_bottom", "custom_builder", builder=self.builders.von_mises_stress("bottom"))
-        self._registry["rotation"] = PostOutputSpec("rotation", "field_fea_output")
-        self._registry["displacement"] = PostOutputSpec("displacement", "field_fea_output")
-        self._registry["mid_strain"] = PostOutputSpec("mid_strain", "field_fea_output")
-        self._registry["shear_strain"] = PostOutputSpec("shear_strain", "field_fea_output")
-        self._registry["curvature"] = PostOutputSpec("curvature", "field_fea_output")
-        self._registry["cg"] = PostOutputSpec("cg", "derived_builtin")
-        self._registry["aggregated_stress"] = PostOutputSpec("aggregated_stress", "derived_builtin")
-        self._registry["disp_extracted"] = PostOutputSpec("disp_extracted", "derived_builtin")
-        self._registry["displacements"] = PostOutputSpec("displacements", "derived_builtin")
-        self._registry["rotations"] = PostOutputSpec("rotations", "derived_builtin")
+    def clear(self):
+        """Remove all requested postprocessing outputs."""
+        self._outputs.clear()
+        return self
+
+    def _add(self, output):
+        self._outputs.append(output)
+        return self
+
+    def _displacement_components(self, context):
+        return ufl.split(context.post_fea.inputs_dict["disp_solid"]["function"])
+
+    def _compliance_form(self, context):
+        u_mid, theta = self._displacement_components(context)
+        return context.shell_pde.compliance(
+            u_mid,
+            theta,
+            context.post_fea.inputs_dict["uhat"]["function"],
+            context.post_fea.inputs_dict["thickness"]["function"],
+            context.post_fea.inputs_dict["F_solid"]["function"],
+            context.post_fea.inputs_dict["M_solid"]["function"],
+        )
+
+    def _mass_and_cg_forms(self, context):
+        return context.shell_pde.cg_form(
+            context.post_fea.inputs_dict["uhat"]["function"],
+            context.post_fea.inputs_dict["thickness"]["function"],
+            context.post_fea.inputs_dict["density"]["function"],
+        )
+
+    def _elastic_energy_form(self, context):
+        return context.shell_pde.elastic_energy(
+            context.post_fea.inputs_dict["disp_solid"]["function"],
+            context.post_fea.inputs_dict["uhat"]["function"],
+            context.post_fea.inputs_dict["thickness"]["function"],
+            None,
+        )
+
+    def _strain_element(self):
+        return ufl.TensorElement("DG", self.shell_model.mesh.ufl_cell(), degree=0, shape=(2, 2))
+
+    def _shear_strain_element(self):
+        return ufl.VectorElement("DG", self.shell_model.mesh.ufl_cell(), degree=0, dim=2)
+
+    def _vector_node_element(self):
+        return ufl.VectorElement("CG", self.shell_model.mesh.ufl_cell(), degree=1, dim=3)
+
+    def add_default_outputs(self):
+        """Request the default shell output bundle."""
+        return (
+            self.compliance()
+            .mass()
+            .cg()
+            .elastic_energy()
+            .disp_extracted()
+            .displacements()
+            .rotations()
+            .aggregated_stress()
+        )
+
+    def add_mass_properties(self):
+        """Request mass and center-of-gravity outputs."""
+        return self.mass().cg()
+
+    def add_kinematics(self):
+        """Request displacement and rotation kinematic outputs."""
+        return self.disp_extracted().displacements().rotations()
+
+    def add_strains(self):
+        """Request strain-related field outputs."""
+        return self.mid_strain().shear_strain().curvature()
+
+    def add_stress_outputs(self, include_fields=False):
+        """Request built-in stress outputs."""
+        self.aggregated_stress()
+        if include_fields:
+            self.stress().stress_top().stress_mid().stress_bottom()
+        return self
 
     def context(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
         """Create a reusable postprocessing context for a solved or external displacement."""
@@ -422,30 +404,27 @@ class ShellPostProcessor:
             debug_mode=debug_mode,
         )
 
-    def add_scalar_output(self, name, builder, docstring=None):
-        """Register a custom scalar postprocessing output."""
-        self._registry[name] = PostOutputSpec(name, "custom_builder", builder=builder, docstring=docstring)
+    def add_scalar_form(self, name, form_fn, arguments):
+        """Request a custom scalar output assembled from a UFL form."""
+        return self._add(ScalarFormOutput(name, form_fn, arguments))
 
-    def add_field_output(self, name, builder, docstring=None):
-        """Register a custom field postprocessing output."""
-        self._registry[name] = PostOutputSpec(name, "custom_builder", builder=builder, docstring=docstring)
+    def add_field_form(self, name, form_fn, arguments, element, reorder=None, record=None, vtk=False):
+        """Request a custom projected field output assembled from a UFL form."""
+        return self._add(FieldFormOutput(name, form_fn, arguments, element, reorder=reorder, record=record, vtk=vtk))
 
-    def add_derived_output(self, name, compute_fn, docstring=None):
-        """Register a custom derived postprocessing output from a CSDL callback."""
-        self._registry[name] = PostOutputSpec(
-            name,
-            "custom_derived",
-            compute_fn=compute_fn,
-            docstring=docstring,
-        )
+    def add_form_ratio(self, name, numerator_fn, numerator_arguments, denominator_fn, denominator_arguments):
+        """Request a custom scalar output computed as numerator form / denominator form."""
+        return self._add(RatioFormOutput(name, numerator_fn, numerator_arguments, denominator_fn, denominator_arguments))
 
-    def add_output(self, name, builder, docstring=None):
-        """Register a custom postprocessing output from a builder callback."""
-        self._registry[name] = PostOutputSpec(name, "custom_builder", builder=builder, docstring=docstring)
+    def add_derived_output(self, name, compute_fn):
+        """Request a custom CSDL output computed after form assembly."""
+        return self._add(CSDLOutput(name, compute_fn))
 
     def evaluate(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compatibility wrapper returning the default set of postprocessing outputs."""
-        context = self.context(
+        """Compatibility wrapper for existing callers."""
+        if not self._outputs:
+            self.add_default_outputs()
+        return self.compute(
             state=state,
             material=material,
             loads=loads,
@@ -453,264 +432,323 @@ class ShellPostProcessor:
             node_disp=node_disp,
             debug_mode=debug_mode,
         )
-        outputs = self.compute_many(
-            self.DEFAULT_OUTPUTS,
-            context=context,
-        )
+
+    def compute(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False, context=None):
+        """Compute all requested postprocessing outputs and return a VariableGroup."""
+        if not self._outputs:
+            raise ValueError("No RMShell postprocessing outputs have been requested.")
+        if context is None:
+            context = self.context(
+                state=state,
+                material=material,
+                loads=loads,
+                displacement=displacement,
+                node_disp=node_disp,
+                debug_mode=debug_mode,
+            )
+        scalar_forms = {}
+        field_forms = {}
+        for output in self._outputs:
+            output.collect_forms(context, scalar_forms, field_forms)
+
+        form_outputs = self._evaluate_forms(context, scalar_forms, field_forms)
+        outputs = csdl.VariableGroup()
+        for output in self._outputs:
+            output.finalize(context, form_outputs, outputs)
         outputs.disp_solid = context.displacement
         outputs.uhat = context.inputs().uhat
         return outputs
 
-    def compute(self, name, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False, context=None):
-        """Compute one named postprocessing output."""
-        if context is None:
-            context = self.context(
-                state=state,
-                material=material,
-                loads=loads,
-                displacement=displacement,
-                node_disp=node_disp,
-                debug_mode=debug_mode,
-            )
-        if name in context._cache:
-            return context._cache[name]
-        results = self.compute_many([name], context=context)
-        return getattr(results, name)
-
-    def compute_many(self, names, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False, context=None):
-        """Compute multiple named postprocessing outputs and return them in a VariableGroup."""
-        if context is None:
-            context = self.context(
-                state=state,
-                material=material,
-                loads=loads,
-                displacement=displacement,
-                node_disp=node_disp,
-                debug_mode=debug_mode,
-            )
-        result = csdl.VariableGroup()
-        names = list(names)
-        pending_form_specs = {}
-        pending_field_specs = {}
-        for name in names:
-            if name in context._cache:
-                setattr(result, name, context._cache[name])
-                continue
-            spec = self._build_spec(name, context)
-            if spec.kind == "scalar_fea_output":
-                pending_form_specs[name] = self._make_scalar_fea_output_spec(name, context)
-            elif spec.kind == "field_fea_output":
-                pending_field_specs[name] = self._make_field_fea_output_spec(name, context)
-            elif spec.kind == "scalar_form_builder":
-                pending_form_specs[name] = spec
-            elif spec.kind == "field_form_builder":
-                pending_field_specs[name] = spec
-            elif spec.kind == "derived_from_forms":
-                numerator = self._compute_spec(name + "__num", spec.metadata["numerator"], context)
-                denominator = self._compute_spec(name + "__den", spec.metadata["denominator"], context)
-                value = numerator / denominator
-                context._cache[name] = value
-                setattr(result, name, value)
-            elif spec.kind == "derived_from_forms_ratio":
-                numerator = self._compute_spec(name + "__num", spec.metadata["numerator"], context)
-                denominator = self._compute_spec(name + "__den", spec.metadata["denominator"], context)
-                value = numerator / denominator
-                context._cache[name] = value
-                setattr(result, name, value)
-            elif spec.kind == "custom_derived":
-                value = spec.metadata["compute_fn"](context)
-                context._cache[name] = value
-                setattr(result, name, value)
-            elif spec.kind == "derived_builtin":
-                value = self._compute_builtin_derived(name, context)
-                context._cache[name] = value
-                setattr(result, name, value)
-            else:
-                raise ValueError(f"Unsupported postprocessing output kind '{spec.kind}' for '{name}'.")
-
-        if pending_form_specs or pending_field_specs:
-            fea_outputs = self._evaluate_form_specs(context, pending_form_specs, pending_field_specs)
-            for name, value in fea_outputs.items():
-                context._cache[name] = value
-                setattr(result, name, value)
-
-        for name in names:
-            if not hasattr(result, name):
-                setattr(result, name, context._cache[name])
-        return result
-
     def mass_properties(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compute mass and center of gravity outputs together."""
-        return self.compute_many(
-            ["mass", "cg", "cgx_num", "cgy_num", "cgz_num"],
-            state=state,
-            material=material,
-            loads=loads,
-            displacement=displacement,
-            node_disp=node_disp,
-            debug_mode=debug_mode,
-        )
+        """Request mass and center-of-gravity outputs."""
+        return self.add_mass_properties()
 
     def kinematics(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compute displacement and rotation kinematic outputs together."""
-        return self.compute_many(
-            ["disp_extracted", "displacements", "rotations"],
-            state=state,
-            material=material,
-            loads=loads,
-            displacement=displacement,
-            node_disp=node_disp,
-            debug_mode=debug_mode,
-        )
+        """Request displacement and rotation kinematic outputs."""
+        return self.add_kinematics()
 
     def strains(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compute strain-related field outputs together."""
-        return self.compute_many(
-            ["mid_strain", "shear_strain", "curvature"],
-            state=state,
-            material=material,
-            loads=loads,
-            displacement=displacement,
-            node_disp=node_disp,
-            debug_mode=debug_mode,
-        )
+        """Request strain-related field outputs."""
+        return self.add_strains()
 
     def compliance(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compute compliance only."""
-        return self.compute("compliance", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
+        """Request compliance."""
+        raw_compliance = ScalarFormOutput(
+            "__raw_compliance",
+            self._compliance_form,
+            ["disp_solid", "F_solid", "M_solid", "thickness", "uhat"],
+        )
+
+        def compute_compliance(context, form_outputs, outputs):
+            return form_outputs["__raw_compliance"] + csdl.vdot(context.inputs().load_vector, context.displacement)
+
+        raw_compliance.name = "__raw_compliance"
+        return self._add(CSDLOutput("compliance", compute_compliance, dependencies=[raw_compliance]))
 
     def mass(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compute mass only."""
-        return self.compute("mass", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
+        """Request mass."""
+        return self._add(ScalarFormOutput(
+            "mass",
+            lambda context: self._mass_and_cg_forms(context)[3],
+            ["thickness", "density", "uhat"],
+        ))
 
     def cg(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compute center of gravity only."""
-        return self.compute("cg", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
+        """Request center of gravity."""
+        cgx = ScalarFormOutput(
+            "__cgx_num",
+            lambda context: self._mass_and_cg_forms(context)[0],
+            ["thickness", "density", "uhat"],
+        )
+        cgy = ScalarFormOutput(
+            "__cgy_num",
+            lambda context: self._mass_and_cg_forms(context)[1],
+            ["thickness", "density", "uhat"],
+        )
+        cgz = ScalarFormOutput(
+            "__cgz_num",
+            lambda context: self._mass_and_cg_forms(context)[2],
+            ["thickness", "density", "uhat"],
+        )
+        mass = ScalarFormOutput(
+            "__cg_mass",
+            lambda context: self._mass_and_cg_forms(context)[3],
+            ["thickness", "density", "uhat"],
+        )
+
+        def compute_cg(context, form_outputs, outputs):
+            return csdl.concatenate((
+                form_outputs["__cgx_num"] / form_outputs["__cg_mass"],
+                form_outputs["__cgy_num"] / form_outputs["__cg_mass"],
+                form_outputs["__cgz_num"] / form_outputs["__cg_mass"],
+            ))
+
+        return self._add(CSDLOutput("cg", compute_cg, dependencies=[cgx, cgy, cgz, mass]))
 
     def disp_extracted(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compute extracted nodal displacements only."""
-        return self.compute("disp_extracted", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
+        """Request extracted nodal displacements."""
+        return self._add(CSDLOutput(
+            "disp_extracted",
+            lambda context, form_outputs, outputs: DisplacementExtractionModel(shell_pde=context.shell_pde).evaluate(context.displacement),
+        ))
 
     def mid_strain(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compute mid-surface strain field only."""
-        return self.compute("mid_strain", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
+        """Request mid-surface strain field."""
+        return self._add(FieldFormOutput(
+            "mid_strain",
+            lambda context: context.shell_pde.elastic_model.eps,
+            ["disp_solid", "uhat"],
+            self._strain_element(),
+            reorder="mid_strain",
+            record=self.shell_model.record,
+        ))
 
     def pnorm_stress(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
-        """Compute the built-in p-norm stress output only."""
-        return self.compute("pnorm_stress", state=state, material=material, loads=loads, displacement=displacement, node_disp=node_disp, debug_mode=debug_mode)
+        """Request the built-in p-norm stress output."""
+        return self._add(self._pnorm_stress_output("pnorm_stress", rho=self.shell_model.rho, m=self.shell_model.m))
 
-    def _build_spec(self, name, context):
-        if name not in self._registry:
-            raise KeyError(f"Unknown postprocessing output '{name}'.")
-        spec = self._registry[name]
-        if spec.kind == "custom_builder":
-            built = spec.metadata["builder"](context)
-            built.name = name
-            return built
-        return spec
+    def elastic_energy(self):
+        return self._add(ScalarFormOutput(
+            "elastic_energy",
+            self._elastic_energy_form,
+            ["thickness", "disp_solid", "uhat"],
+        ))
 
-    def _compute_spec(self, name, spec, context):
-        temp_group = self.compute_many([], context=context)
-        _ = temp_group
-        if spec.kind == "scalar_form_builder":
-            return self._evaluate_form_specs(context, {name: spec}, {})[name]
-        if spec.kind == "field_form_builder":
-            return self._evaluate_form_specs(context, {}, {name: spec})[name]
-        raise ValueError(f"Unsupported helper spec kind '{spec.kind}'.")
+    def displacements(self):
+        return self._add(FieldFormOutput(
+            "displacements",
+            lambda context: self._displacement_components(context)[0],
+            ["disp_solid"],
+            self._vector_node_element(),
+            reorder="displacement",
+            record=self.shell_model.record,
+        ))
 
-    def _make_scalar_fea_output_spec(self, name, context):
-        base = context.post_fea.outputs_dict[name]
-        return PostOutputSpec(
+    def rotations(self):
+        return self._add(FieldFormOutput(
+            "rotations",
+            lambda context: self._displacement_components(context)[1],
+            ["disp_solid"],
+            self._vector_node_element(),
+            reorder="rotation",
+            record=self.shell_model.record,
+        ))
+
+    def shear_strain(self):
+        return self._add(FieldFormOutput(
+            "shear_strain",
+            lambda context: context.shell_pde.elastic_model.gamma,
+            ["disp_solid", "uhat"],
+            self._shear_strain_element(),
+            reorder="shear_strain",
+            record=self.shell_model.record,
+        ))
+
+    def curvature(self):
+        return self._add(FieldFormOutput(
+            "curvature",
+            lambda context: context.shell_pde.elastic_model.kappa,
+            ["disp_solid", "uhat"],
+            self._strain_element(),
+            reorder="curvature",
+            record=self.shell_model.record,
+        ))
+
+    def stress(self):
+        return self._add(self._von_mises_stress_output("stress", surface="top"))
+
+    def stress_top(self):
+        return self._add(self._von_mises_stress_output("stress_top", surface="top"))
+
+    def stress_mid(self):
+        return self._add(self._von_mises_stress_output("stress_mid", surface="mid"))
+
+    def stress_bottom(self):
+        return self._add(self._von_mises_stress_output("stress_bottom", surface="bottom"))
+
+    def aggregated_stress(self):
+        pnorm = self._pnorm_stress_output("__aggregated_pnorm_stress", rho=self.shell_model.rho, m=self.shell_model.m)
+
+        def compute_aggregated(context, form_outputs, outputs):
+            return AggregatedStressModel(m=context.shell_model.m, rho=context.shell_model.rho).evaluate(
+                form_outputs["__aggregated_pnorm_stress"]
+            )
+
+        return self._add(CSDLOutput("aggregated_stress", compute_aggregated, dependencies=[pnorm]))
+
+    def average_strain(self, name, strain_type="mid", component="xx", region=None):
+        if component not in self._STRAIN_COMPONENTS:
+            raise ValueError(f"Unsupported strain component '{component}'.")
+        i, j = self._STRAIN_COMPONENTS[component]
+
+        def strain_form(context):
+            if strain_type == "mid":
+                strain = context.shell_pde.elastic_model.eps
+            elif strain_type == "curvature":
+                strain = context.shell_pde.elastic_model.kappa
+            else:
+                raise ValueError(f"Unsupported strain_type '{strain_type}'.")
+            return strain[i, j] * ufl.as_ufl(1.0) * context.region_measure(region)
+
+        return self.add_form_ratio(
             name,
-            "scalar_form_builder",
-            form=base["form"],
-            arguments=base["arguments"],
+            strain_form,
+            ["disp_solid", "uhat"],
+            lambda context: context.area_form(region),
+            ["uhat"],
         )
 
-    def _make_field_fea_output_spec(self, name, context):
-        base = context.post_fea.outputs_field_dict[name]
-        return PostOutputSpec(
+    def pnorm_stress_custom(self, name, rho=100, m=1e-6, region=None):
+        return self._add(self._pnorm_stress_output(name, rho=rho, m=m, region=region))
+
+    def _pnorm_stress_output(self, name, rho=100, m=1e-6, region=None):
+        def form_fn(context):
+            if not getattr(context.material, "is_isotropic", False):
+                raise ValueError("pnorm_stress requires material created with from_isotropic(...).")
+            dx_measure = ufl.Measure("dx", domain=context.shell_model.mesh, metadata={"quadrature_degree": 4})
+            if region is not None:
+                dx_measure = context.region_measure(region)
+            return context.shell_pde.pnorm_stress(
+                context.post_fea.inputs_dict["disp_solid"]["function"],
+                context.post_fea.inputs_dict["uhat"]["function"],
+                context.post_fea.inputs_dict["thickness"]["function"],
+                context.post_fea.inputs_dict["E"]["function"],
+                context.post_fea.inputs_dict["nu"]["function"],
+                dx_measure,
+                m=m,
+                rho=rho,
+                alpha=None,
+                regularization=False,
+            )
+
+        return ScalarFormOutput(name, form_fn, ["disp_solid", "thickness", "E", "nu", "uhat"])
+
+    def _von_mises_stress_output(self, name, surface="top"):
+        surface_map = {"top": "Top", "mid": "Mid", "middle": "Mid", "bottom": "Bot", "bot": "Bot"}
+        surface_key = surface.lower()
+        if surface_key not in surface_map:
+            raise ValueError("surface must be one of 'top', 'mid', or 'bottom'.")
+
+        def form_fn(context):
+            if not getattr(context.material, "is_isotropic", False):
+                raise ValueError("von_mises_stress requires material created with from_isotropic(...).")
+            return context.shell_pde.von_Mises_stress(
+                context.post_fea.inputs_dict["disp_solid"]["function"],
+                context.post_fea.inputs_dict["uhat"]["function"],
+                context.post_fea.inputs_dict["thickness"]["function"],
+                context.post_fea.inputs_dict["E"]["function"],
+                context.post_fea.inputs_dict["nu"]["function"],
+                surface=surface_map[surface_key],
+            )
+
+        return FieldFormOutput(
             name,
-            "field_form_builder",
-            form=base["form"],
-            arguments=base["arguments"],
-            element=base["function"].function_space.ufl_element(),
-            reorder=name,
+            form_fn,
+            ["thickness", "disp_solid", "E", "nu", "uhat"],
+            ("DG", 1),
+            record=self.shell_model.record,
         )
 
-    def _evaluate_form_specs(self, context, scalar_specs, field_specs):
+    def _resolve_field_record(self, record):
+        if record is None:
+            record = self.shell_model.record
+        return record
+
+    def _next_record_name(self, name):
+        self._record_file_counter += 1
+        return f"{name}_{self._record_file_counter}"
+
+    def _evaluate_forms(self, context, scalar_forms, field_forms):
         fea = copy.copy(context.post_fea)
         fea.outputs_dict = {}
         fea.outputs_field_dict = {}
-        for name, spec in scalar_specs.items():
+        for name, (form, arguments) in scalar_forms.items():
             fea.outputs_dict[name] = dict(
-                form=spec.metadata["form"],
+                form=form,
                 shape=1,
-                arguments=spec.metadata["arguments"],
+                arguments=arguments,
             )
-        for name, spec in field_specs.items():
-            function_space = dolfinx.fem.FunctionSpace(context.shell_model.mesh, spec.metadata["element"])
+        for name, (form, arguments, element, reorder, record, vtk) in field_forms.items():
+            function_space = dolfinx.fem.FunctionSpace(context.shell_model.mesh, element)
+            record = self._resolve_field_record(record)
+            record_name = self._next_record_name(name) if record else name
             fea.outputs_field_dict[name] = dict(
-                form=spec.metadata["form"],
+                form=form,
                 function=Function(function_space),
                 shape=len(getFuncArray(Function(function_space))),
-                arguments=spec.metadata["arguments"],
-                record=False,
+                arguments=arguments,
+                record=record,
                 recorder=None,
+                vtk=vtk,
+                reorder=reorder,
+            )
+            fea.outputs_field_dict[name]["recorder"] = fea.createRecorder(
+                record_name,
+                fea.outputs_field_dict[name]["record"],
+                vtk=fea.outputs_field_dict[name]["vtk"],
             )
         outputs = FEAModel(fea=[fea], fea_name="rm_shell_post_subset").evaluate(
             context.inputs(),
             debug_mode=context.debug_mode,
         )
         result = {}
-        for name in scalar_specs:
+        for name in scalar_forms:
             result[name] = getattr(outputs, name)
-        for name in field_specs:
+        for name in field_forms:
             value = getattr(outputs, name)
-            if name == "mid_strain":
+            reorder = field_forms[name][3]
+            if reorder == "mid_strain":
                 value = context.shell_model._reorder_elements(value.reshape((-1, 2, 2)))
-            elif name == "shear_strain":
+            elif reorder == "shear_strain":
                 value = context.shell_model._reorder_elements(value.reshape((-1, 2)))
-            elif name == "curvature":
+            elif reorder == "curvature":
                 value = context.shell_model._reorder_elements(value.reshape((-1, 2, 2)))
-            elif name == "displacement":
+            elif reorder == "displacement":
                 value = context.shell_model._reorder_nodes(value.reshape((-1, 3)))
-            elif name == "rotation":
+            elif reorder == "rotation":
                 value = context.shell_model._reorder_nodes(value.reshape((-1, 3)))
             result[name] = value
         return result
-
-    def _compute_builtin_derived(self, name, context):
-        if name == "compliance":
-            raw_compliance = self._compute_spec(
-                "_raw_compliance",
-                self._make_scalar_fea_output_spec("compliance", context),
-                context,
-            )
-            compliance = raw_compliance + csdl.vdot(context.inputs().load_vector, context.displacement)
-            compliance.add_name("compliance")
-            return compliance
-        if name == "cg":
-            numerators = self.compute_many(["cgx_num", "cgy_num", "cgz_num", "mass"], context=context)
-            cg = csdl.concatenate((numerators.cgx_num / numerators.mass, numerators.cgy_num / numerators.mass, numerators.cgz_num / numerators.mass))
-            cg.add_name("cg")
-            return cg
-        if name == "aggregated_stress":
-            pnorm = self.compute("pnorm_stress", context=context)
-            agg = AggregatedStressModel(m=context.shell_model.m, rho=context.shell_model.rho).evaluate(pnorm)
-            agg.add_name("aggregated_stress")
-            return agg
-        if name == "disp_extracted":
-            disp = DisplacementExtractionModel(shell_pde=context.shell_pde).evaluate(context.displacement)
-            disp.add_name("disp_extracted")
-            return disp
-        if name == "displacements":
-            displacement = self.compute("displacement", context=context)
-            return displacement
-        if name == "rotations":
-            rotation = self.compute("rotation", context=context)
-            return rotation
-        raise KeyError(f"Unknown built-in derived output '{name}'.")
 
 
 class RMShellModel:
@@ -772,7 +810,7 @@ class RMShellModel:
     @property
     def post_fea(self):
         if self._post_fea is None:
-            self._post_fea = self._build_post_fea()
+            self._post_fea = self._build_post_input_fea()
         return self._post_fea
 
     def set_up_bcs(self, bc_locs_func, PENALTY_BC):
@@ -934,7 +972,7 @@ class RMShellModel:
 
         return shell_pde, solve_fea
 
-    def _build_post_fea(self):
+    def _build_post_input_fea(self):
         shell_pde = self.shell_pde
         post_fea = FEA(self.mesh)
         post_fea.record = False
@@ -954,7 +992,6 @@ class RMShellModel:
         post_fea.add_input("density", Function(shell_pde.VT), init_val=1.0, record=False)
         post_fea.add_input("uhat", Function(shell_pde.VU), init_val=0.0, record=False)
 
-        u_mid, theta = ufl.split(disp_in)
         shell_pde.set_elastic_model(
             w=disp_in,
             uhat=post_fea.inputs_dict["uhat"]["function"],
@@ -963,67 +1000,6 @@ class RMShellModel:
             D=post_fea.inputs_dict["D"]["function"],
             As=post_fea.inputs_dict["As"]["function"],
         )
-        compliance_form = shell_pde.compliance(
-            u_mid,
-            theta,
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            post_fea.inputs_dict["F_solid"]["function"],
-            post_fea.inputs_dict["M_solid"]["function"],
-        )
-        cg_x_num_form, cg_y_num_form, cg_z_num_form, mass_form = shell_pde.cg_form(
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            post_fea.inputs_dict["density"]["function"],
-        )
-        elastic_energy_form = shell_pde.elastic_energy(
-            disp_in,
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            None,
-        )
-        dx_reduced = ufl.Measure("dx", domain=self.mesh, metadata={"quadrature_degree": 4})
-        pnorm_stress_form = shell_pde.pnorm_stress(
-            disp_in,
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            post_fea.inputs_dict["E"]["function"],
-            post_fea.inputs_dict["nu"]["function"],
-            dx_reduced,
-            m=self.m,
-            rho=self.rho,
-            alpha=None,
-            regularization=False,
-        )
-        stress_form = shell_pde.von_Mises_stress(
-            disp_in,
-            post_fea.inputs_dict["uhat"]["function"],
-            post_fea.inputs_dict["thickness"]["function"],
-            post_fea.inputs_dict["E"]["function"],
-            post_fea.inputs_dict["nu"]["function"],
-            surface="Top",
-        )
-        mid_strain = shell_pde.elastic_model.eps
-        shear_strain = shell_pde.elastic_model.gamma
-        curvature = shell_pde.elastic_model.kappa
-        plane_strain_element = ufl.TensorElement("DG", self.mesh.ufl_cell(), degree=0, shape=(2, 2))
-        shear_strain_element = ufl.VectorElement("DG", self.mesh.ufl_cell(), degree=0, dim=2)
-        rotation_element = ufl.VectorElement("CG", self.mesh.ufl_cell(), degree=1, dim=3)
-        displacement_element = ufl.VectorElement("CG", self.mesh.ufl_cell(), degree=1, dim=3)
-
-        post_fea.add_output("compliance", compliance_form, ["disp_solid", "F_solid", "M_solid", "thickness", "uhat"])
-        post_fea.add_output("mass", mass_form, ["thickness", "density", "uhat"])
-        post_fea.add_output("cgx_num", cg_x_num_form, ["thickness", "density", "uhat"])
-        post_fea.add_output("cgy_num", cg_y_num_form, ["thickness", "density", "uhat"])
-        post_fea.add_output("cgz_num", cg_z_num_form, ["thickness", "density", "uhat"])
-        post_fea.add_output("elastic_energy", elastic_energy_form, ["thickness", "disp_solid", "uhat"])
-        post_fea.add_output("pnorm_stress", pnorm_stress_form, ["thickness", "disp_solid", "E", "nu", "uhat"])
-        post_fea.add_field_output("stress", stress_form, ["thickness", "disp_solid", "E", "nu", "uhat"], element=("DG", 1), record=False, vtk=False)
-        post_fea.add_field_output("mid_strain", mid_strain, ["disp_solid", "uhat"], element=plane_strain_element, vtk=False, record=False)
-        post_fea.add_field_output("shear_strain", shear_strain, ["disp_solid", "uhat"], element=shear_strain_element, vtk=False, record=False)
-        post_fea.add_field_output("curvature", curvature, ["disp_solid", "uhat"], element=plane_strain_element, vtk=False, record=False)
-        post_fea.add_field_output("rotation", theta, ["disp_solid"], element=rotation_element, record=False, vtk=False)
-        post_fea.add_field_output("displacement", u_mid, ["disp_solid"], element=displacement_element, record=False, vtk=False)
 
         return post_fea
 
@@ -1108,13 +1084,23 @@ class RMShellModel:
         shell_inputs = self._prepare_solver_inputs(material, loads, node_disp=node_disp)
 
         print("=" * 40)
-        F_solid_func = Function(self.shell_pde.VF)
-        F_solid_func.x.array[:] = shell_inputs.F_solid.value
-        print(
-            "Total aero force projected to solid: {}".format(
-                [dolfinx.fem.assemble_scalar(dolfinx.fem.form(F_solid_func[i] * ufl.dx)) for i in range(3)]
+        if getattr(loads, "load_vector", None) is not None:
+            print(
+                "Direct generalized shell load-vector norm: {:.6e}".format(
+                    np.linalg.norm(shell_inputs.load_vector.value)
+                )
             )
-        )
+        if any(
+            getattr(loads, name, None) is not None
+            for name in ("nodal_forces", "nodal_pressure", "nodal_moments")
+        ):
+            F_solid_func = Function(self.shell_pde.VF)
+            F_solid_func.x.array[:] = shell_inputs.F_solid.value
+            print(
+                "Total field load projected to solid: {}".format(
+                    [dolfinx.fem.assemble_scalar(dolfinx.fem.form(F_solid_func[i] * ufl.dx)) for i in range(3)]
+                )
+            )
         print("=" * 40)
         print("Solving the RM shell model ...")
         raw_outputs = FEAModel(fea=[self.fea], fea_name="rm_shell").evaluate(shell_inputs, debug_mode=debug_mode)

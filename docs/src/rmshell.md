@@ -131,7 +131,8 @@ disp = state.disp_solid
 
 ## Postprocessing
 
-The postprocessor is exposed as `shell.post`.
+The postprocessor is exposed as `shell.post`. Request the outputs you want, then
+call `compute(...)` once.
 
 Default output bundle:
 
@@ -139,36 +140,54 @@ Default output bundle:
 outputs = shell.post.evaluate(state=state)
 ```
 
-Selected outputs:
+Explicit output bundle:
 
 ```python
-compliance = shell.post.compute("compliance", state=state)
-mass_and_cg = shell.post.compute_many(["mass", "cg"], state=state)
+outputs = (
+    shell.post.clear()
+    .compliance()
+    .elastic_energy()
+    .mass_properties()
+    .kinematics()
+    .compute(state=state)
+)
 ```
 
 Grouped helpers:
 
 ```python
-mass_props = shell.post.mass_properties(state=state)
-kinematics = shell.post.kinematics(state=state)
-strains = shell.post.strains(state=state)
+outputs = (
+    shell.post.clear()
+    .mass_properties()
+    .kinematics()
+    .strains()
+    .compute(state=state)
+)
 ```
 
 Reusable context:
 
 ```python
 context = shell.post.context(state=state)
-mass = shell.post.compute("mass", context=context)
-stress = shell.post.compute("pnorm_stress", context=context)
+outputs = (
+    shell.post.clear()
+    .mass()
+    .pnorm_stress()
+    .compute(context=context)
+)
 ```
 
 Stress outputs for isotropic materials:
 
 ```python
-pnorm = shell.post.compute("pnorm_stress", state=state)
-top_stress = shell.post.compute("stress", state=state)
-mid_stress = shell.post.compute("stress_mid", state=state)
-bottom_stress = shell.post.compute("stress_bottom", state=state)
+outputs = (
+    shell.post.clear()
+    .pnorm_stress()
+    .stress()
+    .stress_mid()
+    .stress_bottom()
+    .compute(state=state)
+)
 ```
 
 `stress` is the top-surface von Mises field. The explicit `stress_top`, `stress_mid`, and `stress_bottom` names are available when a workflow needs to choose the through-thickness recovery surface.
@@ -187,46 +206,34 @@ This separation lets you reuse the shell postprocessor even when the displacemen
 
 ## Custom Outputs
 
-Built-in builder helpers can register new outputs quickly:
+Built-in helpers can register new outputs quickly:
 
 ```python
-shell.post.add_scalar_output(
+shell.post.clear().average_strain(
     "avg_eps_x",
-    shell.post.builders.average_strain(
-        strain_type="mid",
-        component="xx",
-    ),
+    strain_type="mid",
+    component="xx",
 )
+outputs = shell.post.compute(state=state)
 ```
 
-You can also define completely custom form-based outputs by returning a `PostOutputSpec`:
+You can also define completely custom form-based outputs directly:
 
 ```python
 import ufl
-from femo_alpha.rm_shell.rm_shell_model import PostOutputSpec
 
-def mean_transverse_displacement_builder(context):
-    w = context.post_fea.inputs_dict["disp_solid"]["function"][2]
-    measure = context.region_measure()
-    return PostOutputSpec(
-        name="",
-        kind="derived_from_forms",
-        numerator=PostOutputSpec(
-            name="",
-            kind="scalar_form_builder",
-            form=w * measure,
-            arguments=["disp_solid"],
-        ),
-        denominator=PostOutputSpec(
-            name="",
-            kind="scalar_form_builder",
-            form=context.area_form(),
-            arguments=["uhat"],
-        ),
-    )
+def mean_w_numerator(context):
+    return context.post_fea.inputs_dict["disp_solid"]["function"][2] * context.region_measure()
 
-shell.post.add_output("mean_w", mean_transverse_displacement_builder)
-mean_w = shell.post.compute("mean_w", state=state)
+shell.post.clear().add_form_ratio(
+    "mean_w",
+    mean_w_numerator,
+    ["disp_solid"],
+    lambda context: context.area_form(),
+    ["uhat"],
+)
+outputs = shell.post.compute(state=state)
+mean_w = outputs.mean_w
 ```
 
 ## Related Material
