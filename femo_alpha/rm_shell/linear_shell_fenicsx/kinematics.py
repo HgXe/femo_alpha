@@ -5,43 +5,8 @@ Contains basic matrix operations for basis transformations
 and voigt notation.
 '''
 
-from ufl import (grad, CellNormal, as_vector, Jacobian, sqrt, dot, cross, 
-                as_matrix, indices, as_tensor, inv, det, Identity)
-     
-
-def gradx(f,uhat):
-    '''
-    Convert the differential operation from the reference domain
-    to the measure in the deformed configuration based on the mesh
-    movement of `uhat`
-
-    f: DOLFINx function for the solution of the physical problem
-    uhat: DOLFIN function for mesh movements
-    '''
-    return dot(grad(f), inv(F(uhat)))
-
-
-def J(uhat):
-    '''
-    Compute the determinant of the deformation gradient used in the
-    integration measure of the deformed configuration wrt the the
-    reference configuration.
-
-    uhat: DOLFINx function for mesh movements
-    '''
-    return det(F(uhat))
-
-def F(uhat):
-    '''
-    Compute the determinant of the deformation gradient used in the
-    integration measure of the deformed configuration wrt the the
-    reference configuration.
-    
-    uhat: DOLFINx function for mesh movements
-    '''
-    order = uhat.function_space.mesh.geometry.dim
-    I = Identity(order) 
-    return I + grad(uhat)
+from ufl import (CellNormal, as_vector, Jacobian, sqrt, dot, cross,
+                as_matrix, indices, as_tensor)
 
 def unit(v):
 

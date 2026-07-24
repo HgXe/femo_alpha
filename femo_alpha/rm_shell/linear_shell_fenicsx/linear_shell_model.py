@@ -19,7 +19,7 @@ from ufl import (VectorElement, MixedElement, dx, indices, as_tensor, as_vector,
                     CellDiameter, CellNormal, FacetNormal, sym, cross,
                     Jacobian, as_matrix, inv)
 
-from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import (J, F, gradx, voigt2D, 
+from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import (voigt2D,
                     gradv_local, global_to_local_inplane, local_basis_inplane)
 from femo_alpha.rm_shell.linear_shell_fenicsx.utils import project
 from dolfinx.fem.petsc import assemble_matrix, assemble_vector
@@ -203,7 +203,7 @@ class ElasticModelShapeOpt(object):
     energy based on the given mesh, function space, and the material properties.
     '''
 
-    def __init__(self,mesh, w, uhat, clt_matrices, shl_offset=None):
+    def __init__(self, mesh, w, clt_matrices, shl_offset=None):
         self.mesh = mesh
         self.w = w
         self.u_mid, self.theta = split(self.w)
@@ -222,9 +222,7 @@ class ElasticModelShapeOpt(object):
         # E01[i,j] is the j-th component of the i-th basis vector:
         self.E01 = global_to_local_inplane(E0,E1)
 
-        ####### Compute the integrator and differentiator based on the mesh deformation #######
-        self.uhat = uhat
-        self.gradu = gradx(self.u_mid, self.uhat)
+        self.gradu = grad(self.u_mid)
 
         self.t_gu = gradv_local(self.gradu,self.E01)
         self.A, self.B, self.D, self.A_s = clt_matrices
@@ -246,7 +244,7 @@ class ElasticModelShapeOpt(object):
         return eps
 
     def local_bending_curvature(self):
-        kappa = sym(gradv_local(gradx(cross(self.E2, self.theta), self.uhat),self.E01))
+        kappa = sym(gradv_local(grad(cross(self.E2, self.theta)), self.E01))
         return kappa
 
     def local_shear_strains(self):
@@ -280,13 +278,13 @@ class ElasticModelShapeOpt(object):
         return N, M, Q
 
     def shearEnergy(self, dx_shear):
-        return 0.5*dot(self.Q,self.gamma)*J(self.uhat)*dx_shear
+        return 0.5*dot(self.Q,self.gamma)*dx_shear
 
     def membraneEnergy(self, dx_inplane):
-        return 0.5*dot(self.N,voigt2D(self.eps))*J(self.uhat)*dx_inplane
+        return 0.5*dot(self.N,voigt2D(self.eps))*dx_inplane
 
     def bendingEnergy(self, dx_inplane):
-        return 0.5*dot(self.M,voigt2D(self.kappa))*J(self.uhat)*dx_inplane
+        return 0.5*dot(self.M,voigt2D(self.kappa))*dx_inplane
 
     def drillingEnergy(self, E, h, dx_drilling=dx):
         h_mesh = CellDiameter(self.mesh)
@@ -301,7 +299,7 @@ class ElasticModelShapeOpt(object):
         else:
             alpha = E*h**3
         drilling_stress = alpha*drilling_strain/h_mesh**2
-        return 0.5*drilling_stress*drilling_strain*J(self.uhat)*dx_drilling
+        return 0.5*drilling_stress*drilling_strain*dx_drilling
 
     def elasticEnergy(self, E=None, h=None, dx_inplane=dx, dx_shear=dx):
 
@@ -325,7 +323,6 @@ class ElasticModelShapeOpt(object):
     #     retval = derivative(elasticEnergy,self.w,dw)
     #     if penalty:
     #         retval += self.penaltyResidual(self.w, dw, g, dss, dSS)
-    #     retval -= inner(f,self.du_mid)*J(self.uhat)*dx
     #     return retval
 
     def weakFormResidual(self, elasticEnergy, f=None, m=None,
@@ -340,10 +337,10 @@ class ElasticModelShapeOpt(object):
             retval += self.penaltyResidual(self.w, dw, g, dss, dSS)
 
         if f is not None:
-            retval -= inner(f, self.du_mid) * J(self.uhat) * dx
+            retval -= inner(f, self.du_mid) * dx
 
         if m is not None:
-            retval -= inner(m, self.dtheta) * J(self.uhat) * dx
+            retval -= inner(m, self.dtheta) * dx
 
         if f is None and m is None:
             raise ValueError("At least one of f or m must be provided.")
@@ -353,14 +350,9 @@ class ElasticModelShapeOpt(object):
     def penaltyResidual(self,u,v,g,dss,dSS):
         beta = Constant(self.mesh, 1E15)
         h_E = CellDiameter(self.mesh)
-        n = CellNormal(self.mesh)
-        N = FacetNormal(self.mesh)
-        # transform normal and area element by Nanson's formula:
-        dsx_dsy_n_x = J(self.uhat)*inv(F(self.uhat).T)*N
-        norm_dsx_dsy_n_x = sqrt(dot(dsx_dsy_n_x, dsx_dsy_n_x))
-        return norm_dsx_dsy_n_x*beta/h_E*inner(u-g, v)*dss + \
-               (norm_dsx_dsy_n_x*beta/h_E*inner(u-g, v))('+')*dSS + \
-               (norm_dsx_dsy_n_x*beta/h_E*inner(u-g, v))('-')*dSS
+        return beta/h_E*inner(u-g, v)*dss + \
+               (beta/h_E*inner(u-g, v))('+')*dSS + \
+               (beta/h_E*inner(u-g, v))('-')*dSS
 
     def inertialResidual(self, rho, h):
         '''
@@ -368,12 +360,12 @@ class ElasticModelShapeOpt(object):
         '''
         h_mesh = CellDiameter(self.mesh)
         retval = 0
-        retval += rho*h*inner(self.u_mid, self.du_mid)*J(self.uhat)*dx
-        retval += rho*h*h_mesh**2*inner(self.theta, self.dtheta)*J(self.uhat)*dx
+        retval += rho*h*inner(self.u_mid, self.du_mid)*dx
+        retval += rho*h*h_mesh**2*inner(self.theta, self.dtheta)*dx
         ## Formulation inspired by https://www.mdpi.com/2673-8716/1/1/5
         # Iz = h**3/12
         # retval += rho*Iz*inner(self.theta, self.dtheta)*dx
-        drilling_inertia = Constant(self.mesh,1.0)*h**3*J(self.uhat)*dx
+        drilling_inertia = Constant(self.mesh,1.0)*h**3*dx
         # retval += drilling_inertia
         return retval
 
@@ -382,7 +374,7 @@ class ShellStressRM:
     Class to compute Reissner-Mindlin shell's stresses using
     linear elastic material model.
     '''
-    def __init__(self, mesh, w, uhat, h_th, E, nu):
+    def __init__(self, mesh, w, h_th, E, nu):
         '''
         Parameters
         ----------
@@ -393,7 +385,6 @@ class ShellStressRM:
         '''
         self.mesh = mesh
         self.u_mid, self.theta = split(w)
-        self.uhat = uhat
         # Normal vector to each element is the third basis vector of the
         # local orthonormal basis (indexed from zero for consistency with Python):
         self.E2 = E2 = CellNormal(mesh)
@@ -433,7 +424,7 @@ class ShellStressRM:
         In-plane gradient components of displacement in the local orthogonal
         coordinate system:
         '''
-        gradu_global = gradx(self.u(xi2), self.uhat) # (3x3 matrix, zero along E2 direction)
+        gradu_global = grad(self.u(xi2)) # (3x3 matrix, zero along E2 direction)
         i,j,k,l = indices(4)
         return as_tensor(self.E01[i,k]*gradu_global[k,l]*self.E01[j,l],(i,j))
 
@@ -455,7 +446,7 @@ class ShellStressRM:
         dudxi2_global = -cross(self.E2,self.theta)
         i,j = indices(2)
         dudxi2_local = as_tensor(dudxi2_global[j]*self.E01[i,j],(i,))
-        gradu2_local = as_tensor(dot(self.E2,gradx(self.u(xi2), self.uhat))[j]*self.E01[i,j],(i,))
+        gradu2_local = as_tensor(dot(self.E2, grad(self.u(xi2)))[j]*self.E01[i,j],(i,))
         return dudxi2_local + gradu2_local
 
     def cauchyStresses(self, xi2):

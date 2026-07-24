@@ -83,6 +83,33 @@ class FEA(object):
             record=record,
         )
 
+    def add_mesh_coordinates_input(self, name: str, record=False,
+                                   input_global_indices=None):
+        """Add the physical mesh coordinates as a differentiable input."""
+        if name in self.inputs_dict:
+            raise ValueError("name has already been used for an input")
+        if input_global_indices is None:
+            input_global_indices = self.mesh.geometry.input_global_indices
+        input_global_indices = np.asarray(input_global_indices, dtype=np.int64)
+        coordinate_space = FunctionSpace(
+            self.mesh,
+            self.mesh.ufl_domain().ufl_coordinate_element(),
+        )
+        coordinate = getattr(self.mesh, "_femo_spatial_coordinate", None)
+        if coordinate is None:
+            coordinate = SpatialCoordinate(self.mesh)
+            self.mesh._femo_spatial_coordinate = coordinate
+        self.inputs_dict[name] = dict(
+            type="mesh_coordinates",
+            coordinate=coordinate,
+            function_space=coordinate_space,
+            mesh=self.mesh,
+            input_global_indices=input_global_indices,
+            shape=(input_global_indices.size, self.mesh.geometry.dim),
+            recorder=None,
+            record=record,
+        )
+
     def add_state(self, name: str, 
                     function: dolfinx.fem.Function, 
                     residual_form: dolfinx.fem.form, 

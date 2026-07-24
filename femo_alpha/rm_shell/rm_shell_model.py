@@ -16,12 +16,12 @@ from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import custom_s
 class ShellState:
     """Container for the solved shell state and the inputs used to obtain it."""
 
-    def __init__(self, material, loads, node_disp, disp_solid, uhat, raw_outputs):
+    def __init__(self, material, loads, node_disp, disp_solid, raw_outputs, mesh_nodes):
         self.material = material
         self.loads = loads
         self.node_disp = node_disp
         self.disp_solid = disp_solid
-        self.uhat = uhat
+        self.mesh_nodes = mesh_nodes
         self.raw_outputs = raw_outputs
 
 
@@ -229,7 +229,7 @@ class CSDLOutput:
 class ShellPostContext:
     """Evaluation context for shell postprocessing outputs."""
 
-    def __init__(self, post_processor, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
+    def __init__(self, post_processor, state=None, material=None, loads=None, displacement=None, node_disp=None, mesh_nodes=None, debug_mode=False):
         self.post = post_processor
         self.shell_model = post_processor.shell_model
         if state is not None:
@@ -237,6 +237,7 @@ class ShellPostContext:
             loads = state.loads
             displacement = state.disp_solid
             node_disp = state.node_disp
+            mesh_nodes = state.mesh_nodes
         else:
             if material is None or loads is None or displacement is None:
                 raise ValueError("Provide either a ShellState or material, loads, and displacement.")
@@ -246,6 +247,7 @@ class ShellPostContext:
         self.node_disp = node_disp
         self.displacement = displacement
         self.debug_mode = debug_mode
+        self.mesh_nodes = mesh_nodes
         self._post_inputs = None
 
     @property
@@ -270,6 +272,7 @@ class ShellPostContext:
                 self.material,
                 self.loads,
                 node_disp=self.node_disp,
+                mesh_nodes=self.mesh_nodes,
             )
             self._post_inputs.disp_solid = self.displacement
         return self._post_inputs
@@ -287,11 +290,8 @@ class ShellPostContext:
         return self.shell_model.dxx(region)
 
     def area_form(self, region=None):
-        """Return the deformed area form over the requested region."""
-        return self.shell_pde.area_subdomain(
-            self.post_fea.inputs_dict["uhat"]["function"],
-            self.region_measure(region),
-        )
+        """Return the current-mesh area form over the requested region."""
+        return self.shell_pde.area_subdomain(self.region_measure(region))
 
     def compute(self):
         """Compute the outputs currently requested on the postprocessor."""
@@ -330,7 +330,6 @@ class ShellPostProcessor:
         return context.shell_pde.compliance(
             u_mid,
             theta,
-            context.post_fea.inputs_dict["uhat"]["function"],
             context.post_fea.inputs_dict["thickness"]["function"],
             context.post_fea.inputs_dict["F_solid"]["function"],
             context.post_fea.inputs_dict["M_solid"]["function"],
@@ -338,7 +337,6 @@ class ShellPostProcessor:
 
     def _mass_and_cg_forms(self, context):
         return context.shell_pde.cg_form(
-            context.post_fea.inputs_dict["uhat"]["function"],
             context.post_fea.inputs_dict["thickness"]["function"],
             context.post_fea.inputs_dict["density"]["function"],
         )
@@ -346,7 +344,6 @@ class ShellPostProcessor:
     def _elastic_energy_form(self, context):
         return context.shell_pde.elastic_energy(
             context.post_fea.inputs_dict["disp_solid"]["function"],
-            context.post_fea.inputs_dict["uhat"]["function"],
             context.post_fea.inputs_dict["thickness"]["function"],
             None,
         )
@@ -392,7 +389,7 @@ class ShellPostProcessor:
             self.stress().stress_top().stress_mid().stress_bottom()
         return self
 
-    def context(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
+    def context(self, state=None, material=None, loads=None, displacement=None, node_disp=None, mesh_nodes=None, debug_mode=False):
         """Create a reusable postprocessing context for a solved or external displacement."""
         return ShellPostContext(
             self,
@@ -402,6 +399,7 @@ class ShellPostProcessor:
             displacement=displacement,
             node_disp=node_disp,
             debug_mode=debug_mode,
+            mesh_nodes=mesh_nodes,
         )
 
     def add_scalar_form(self, name, form_fn, arguments):
@@ -420,7 +418,7 @@ class ShellPostProcessor:
         """Request a custom CSDL output computed after form assembly."""
         return self._add(CSDLOutput(name, compute_fn))
 
-    def evaluate(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
+    def evaluate(self, state=None, material=None, loads=None, displacement=None, node_disp=None, mesh_nodes=None, debug_mode=False):
         """Compatibility wrapper for existing callers."""
         if not self._outputs:
             self.add_default_outputs()
@@ -430,10 +428,11 @@ class ShellPostProcessor:
             loads=loads,
             displacement=displacement,
             node_disp=node_disp,
+            mesh_nodes=mesh_nodes,
             debug_mode=debug_mode,
         )
 
-    def compute(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False, context=None):
+    def compute(self, state=None, material=None, loads=None, displacement=None, node_disp=None, mesh_nodes=None, debug_mode=False, context=None):
         """Compute all requested postprocessing outputs and return a VariableGroup."""
         if not self._outputs:
             raise ValueError("No RMShell postprocessing outputs have been requested.")
@@ -444,6 +443,7 @@ class ShellPostProcessor:
                 loads=loads,
                 displacement=displacement,
                 node_disp=node_disp,
+                mesh_nodes=mesh_nodes,
                 debug_mode=debug_mode,
             )
         scalar_forms = {}
@@ -456,7 +456,7 @@ class ShellPostProcessor:
         for output in self._outputs:
             output.finalize(context, form_outputs, outputs)
         outputs.disp_solid = context.displacement
-        outputs.uhat = context.inputs().uhat
+        outputs.mesh_nodes = context.inputs().mesh_nodes
         return outputs
 
     def mass_properties(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
@@ -476,7 +476,7 @@ class ShellPostProcessor:
         raw_compliance = ScalarFormOutput(
             "__raw_compliance",
             self._compliance_form,
-            ["disp_solid", "F_solid", "M_solid", "thickness", "uhat"],
+            ["disp_solid", "F_solid", "M_solid", "thickness", "mesh_nodes"],
         )
 
         def compute_compliance(context, form_outputs, outputs):
@@ -490,7 +490,7 @@ class ShellPostProcessor:
         return self._add(ScalarFormOutput(
             "mass",
             lambda context: self._mass_and_cg_forms(context)[3],
-            ["thickness", "density", "uhat"],
+            ["thickness", "density", "mesh_nodes"],
         ))
 
     def cg(self, state=None, material=None, loads=None, displacement=None, node_disp=None, debug_mode=False):
@@ -498,22 +498,22 @@ class ShellPostProcessor:
         cgx = ScalarFormOutput(
             "__cgx_num",
             lambda context: self._mass_and_cg_forms(context)[0],
-            ["thickness", "density", "uhat"],
+            ["thickness", "density", "mesh_nodes"],
         )
         cgy = ScalarFormOutput(
             "__cgy_num",
             lambda context: self._mass_and_cg_forms(context)[1],
-            ["thickness", "density", "uhat"],
+            ["thickness", "density", "mesh_nodes"],
         )
         cgz = ScalarFormOutput(
             "__cgz_num",
             lambda context: self._mass_and_cg_forms(context)[2],
-            ["thickness", "density", "uhat"],
+            ["thickness", "density", "mesh_nodes"],
         )
         mass = ScalarFormOutput(
             "__cg_mass",
             lambda context: self._mass_and_cg_forms(context)[3],
-            ["thickness", "density", "uhat"],
+            ["thickness", "density", "mesh_nodes"],
         )
 
         def compute_cg(context, form_outputs, outputs):
@@ -537,7 +537,7 @@ class ShellPostProcessor:
         return self._add(FieldFormOutput(
             "mid_strain",
             lambda context: context.shell_pde.elastic_model.eps,
-            ["disp_solid", "uhat"],
+            ["disp_solid", "mesh_nodes"],
             self._strain_element(),
             reorder="mid_strain",
             record=self.shell_model.record,
@@ -551,14 +551,14 @@ class ShellPostProcessor:
         return self._add(ScalarFormOutput(
             "elastic_energy",
             self._elastic_energy_form,
-            ["thickness", "disp_solid", "uhat"],
+            ["thickness", "disp_solid", "mesh_nodes", "A", "B", "D", "As", "E"],
         ))
 
     def displacements(self):
         return self._add(FieldFormOutput(
             "displacements",
             lambda context: self._displacement_components(context)[0],
-            ["disp_solid"],
+            ["disp_solid", "mesh_nodes"],
             self._vector_node_element(),
             reorder="displacement",
             record=self.shell_model.record,
@@ -568,7 +568,7 @@ class ShellPostProcessor:
         return self._add(FieldFormOutput(
             "rotations",
             lambda context: self._displacement_components(context)[1],
-            ["disp_solid"],
+            ["disp_solid", "mesh_nodes"],
             self._vector_node_element(),
             reorder="rotation",
             record=self.shell_model.record,
@@ -578,7 +578,7 @@ class ShellPostProcessor:
         return self._add(FieldFormOutput(
             "shear_strain",
             lambda context: context.shell_pde.elastic_model.gamma,
-            ["disp_solid", "uhat"],
+            ["disp_solid", "mesh_nodes"],
             self._shear_strain_element(),
             reorder="shear_strain",
             record=self.shell_model.record,
@@ -588,7 +588,7 @@ class ShellPostProcessor:
         return self._add(FieldFormOutput(
             "curvature",
             lambda context: context.shell_pde.elastic_model.kappa,
-            ["disp_solid", "uhat"],
+            ["disp_solid", "mesh_nodes"],
             self._strain_element(),
             reorder="curvature",
             record=self.shell_model.record,
@@ -633,9 +633,9 @@ class ShellPostProcessor:
         return self.add_form_ratio(
             name,
             strain_form,
-            ["disp_solid", "uhat"],
+            ["disp_solid", "mesh_nodes"],
             lambda context: context.area_form(region),
-            ["uhat"],
+            ["mesh_nodes"],
         )
 
     def pnorm_stress_custom(self, name, rho=100, m=1e-6, region=None):
@@ -650,7 +650,6 @@ class ShellPostProcessor:
                 dx_measure = context.region_measure(region)
             return context.shell_pde.pnorm_stress(
                 context.post_fea.inputs_dict["disp_solid"]["function"],
-                context.post_fea.inputs_dict["uhat"]["function"],
                 context.post_fea.inputs_dict["thickness"]["function"],
                 context.post_fea.inputs_dict["E"]["function"],
                 context.post_fea.inputs_dict["nu"]["function"],
@@ -661,7 +660,7 @@ class ShellPostProcessor:
                 regularization=False,
             )
 
-        return ScalarFormOutput(name, form_fn, ["disp_solid", "thickness", "E", "nu", "uhat"])
+        return ScalarFormOutput(name, form_fn, ["disp_solid", "thickness", "E", "nu", "mesh_nodes"])
 
     def _von_mises_stress_output(self, name, surface="top"):
         surface_map = {"top": "Top", "mid": "Mid", "middle": "Mid", "bottom": "Bot", "bot": "Bot"}
@@ -674,7 +673,6 @@ class ShellPostProcessor:
                 raise ValueError("von_mises_stress requires material created with from_isotropic(...).")
             return context.shell_pde.von_Mises_stress(
                 context.post_fea.inputs_dict["disp_solid"]["function"],
-                context.post_fea.inputs_dict["uhat"]["function"],
                 context.post_fea.inputs_dict["thickness"]["function"],
                 context.post_fea.inputs_dict["E"]["function"],
                 context.post_fea.inputs_dict["nu"]["function"],
@@ -684,7 +682,7 @@ class ShellPostProcessor:
         return FieldFormOutput(
             name,
             form_fn,
-            ["thickness", "disp_solid", "E", "nu", "uhat"],
+            ["thickness", "disp_solid", "E", "nu", "mesh_nodes"],
             ("DG", 1),
             record=self.shell_model.record,
         )
@@ -767,6 +765,7 @@ class RMShellModel:
         recorder_path="records",
         strain_heights=None,
         element="CG2CG1",
+        geometry_input_mode="coordinates",
     ):
         self.mesh = mesh
         self.mesh_tags = mesh_tags
@@ -782,9 +781,31 @@ class RMShellModel:
         self.strain_heights = strain_heights
         self.elementwise_pressure = elementwise_pressure
         self.element = element
+        if geometry_input_mode not in {"ale", "coordinates"}:
+            raise ValueError(
+                "geometry_input_mode must be either 'ale' or 'coordinates'; "
+                f"got {geometry_input_mode!r}."
+            )
+        # ``ale`` is retained as a constructor alias; all geometry is now represented by coordinates.
+        self.geometry_input_mode = "coordinates"
 
         self.nel = mesh.topology.index_map(mesh.topology.dim).size_local
         self.nn = mesh.topology.index_map(0).size_local
+        self._coordinate_input_indices = np.asarray(
+            mesh.geometry.input_global_indices, dtype=np.int64
+        )
+        self.reference_mesh_nodes = None
+        if self.geometry_input_mode == "coordinates":
+            if not np.array_equal(
+                np.sort(self._coordinate_input_indices),
+                np.arange(self._coordinate_input_indices.size),
+            ):
+                raise ValueError(
+                    "Mesh-coordinate differentiation currently requires a serial "
+                    "mesh with input_global_indices forming a node permutation."
+                )
+            self.reference_mesh_nodes = np.empty_like(mesh.geometry.x)
+            self.reference_mesh_nodes[self._coordinate_input_indices] = mesh.geometry.x
 
         self.material_inputs = MaterialInputFactory(self)
         self.load_inputs = LoadInputFactory(self)
@@ -931,7 +952,6 @@ class RMShellModel:
         f = Function(shell_pde.VF)
         m = Function(shell_pde.VF)
         density = Function(shell_pde.VT)
-        uhat = Function(shell_pde.VU)
         w = Function(shell_pde.W)
         g = Function(shell_pde.W)
         with g.vector.localForm() as uloc:
@@ -939,7 +959,6 @@ class RMShellModel:
 
         residual_form = shell_pde.pdeRes(
             w=w,
-            uhat=uhat,
             f=f,
             m=m,
             A=A,
@@ -961,12 +980,19 @@ class RMShellModel:
         solve_fea.add_input("D", D, init_val=1.0, record=self.record)
         solve_fea.add_input("As", As, init_val=1.0, record=self.record)
         solve_fea.add_input("density", density, init_val=1.0, record=self.record)
-        solve_fea.add_input("uhat", uhat, init_val=0.0, record=self.record)
+        solve_fea.add_mesh_coordinates_input(
+            "mesh_nodes",
+            record=False,
+            input_global_indices=self._coordinate_input_indices,
+        )
         solve_fea.add_state(
             name="disp_solid",
             function=w,
             residual_form=residual_form,
-            arguments=["thickness", "F_solid", "M_solid", "load_vector", "A", "B", "D", "As", "uhat"],
+            arguments=[
+                "thickness", "F_solid", "M_solid", "load_vector",
+                "A", "B", "D", "As", "mesh_nodes",
+            ],
             record=self.record,
         )
 
@@ -990,11 +1016,14 @@ class RMShellModel:
         post_fea.add_input("E", Function(shell_pde.VT), init_val=1.0, record=False)
         post_fea.add_input("nu", Function(shell_pde.VT), init_val=0.3, record=False)
         post_fea.add_input("density", Function(shell_pde.VT), init_val=1.0, record=False)
-        post_fea.add_input("uhat", Function(shell_pde.VU), init_val=0.0, record=False)
+        post_fea.add_mesh_coordinates_input(
+            "mesh_nodes",
+            record=False,
+            input_global_indices=self._coordinate_input_indices,
+        )
 
         shell_pde.set_elastic_model(
             w=disp_in,
-            uhat=post_fea.inputs_dict["uhat"]["function"],
             A=post_fea.inputs_dict["A"]["function"],
             B=post_fea.inputs_dict["B"]["function"],
             D=post_fea.inputs_dict["D"]["function"],
@@ -1013,10 +1042,9 @@ class RMShellModel:
             return self.mesh.topology.original_cell_index.tolist()
         return self.mesh.geometry.input_global_indices
 
-    def _prepare_common_load_inputs(self, loads, node_disp=None):
+    def _prepare_common_load_inputs(self, loads, node_disp=None, mesh_nodes=None):
         shell_pde = self.shell_pde
         pressure_mesh_indices = self._pressure_indices(shell_pde)
-        deformation_mesh_indices = self.mesh.geometry.input_global_indices
 
         shell_inputs = csdl.VariableGroup()
 
@@ -1055,14 +1083,25 @@ class RMShellModel:
         shell_inputs.load_vector.add_name("load_vector")
 
         node_disp = self._maybe_variable(node_disp, "node_disp")
-        if node_disp is None:
-            node_disp = csdl.Variable(value=np.zeros((len(deformation_mesh_indices), 3)), name="node_disp")
-        shell_inputs.uhat = node_disp[deformation_mesh_indices].reshape((-1,))
-        shell_inputs.uhat.add_name("uhat")
+        mesh_nodes = self._maybe_variable(mesh_nodes, "mesh_nodes")
+        if node_disp is not None and mesh_nodes is not None:
+            raise ValueError("Provide either mesh_nodes or node_disp, not both.")
+        reference_nodes = csdl.Variable(
+            value=self.reference_mesh_nodes,
+            name="reference_mesh_nodes",
+        )
+        if mesh_nodes is None:
+            mesh_nodes = reference_nodes if node_disp is None else reference_nodes + node_disp
+        shell_inputs.mesh_nodes = mesh_nodes
+        shell_inputs.mesh_nodes.add_name("mesh_nodes")
         return shell_inputs
 
-    def _prepare_solver_inputs(self, material, loads, node_disp=None):
-        shell_inputs = self._prepare_common_load_inputs(loads, node_disp=node_disp)
+    def _prepare_solver_inputs(self, material, loads, node_disp=None, mesh_nodes=None):
+        shell_inputs = self._prepare_common_load_inputs(
+            loads,
+            node_disp=node_disp,
+            mesh_nodes=mesh_nodes,
+        )
         material_mesh_indices = self._material_indices(self.shell_pde)
 
         shell_inputs.thickness = material.thickness[material_mesh_indices]
@@ -1079,28 +1118,42 @@ class RMShellModel:
             shell_inputs.nu = csdl.Variable(value=np.full(self.fea.inputs_dict["thickness"]["shape"], 0.3), name="nu_unused")
         return shell_inputs
 
-    def solve(self, material, loads, node_disp=None, debug_mode=False):
+    def solve(self, material, loads, node_disp=None, mesh_nodes=None, debug_mode=False):
         node_disp = self._maybe_variable(node_disp, "node_disp")
-        shell_inputs = self._prepare_solver_inputs(material, loads, node_disp=node_disp)
+        mesh_nodes = self._maybe_variable(mesh_nodes, "mesh_nodes")
+        shell_inputs = self._prepare_solver_inputs(
+            material,
+            loads,
+            node_disp=node_disp,
+            mesh_nodes=mesh_nodes,
+        )
 
         print("=" * 40)
         if getattr(loads, "load_vector", None) is not None:
-            print(
-                "Direct generalized shell load-vector norm: {:.6e}".format(
-                    np.linalg.norm(shell_inputs.load_vector.value)
+            load_vector_value = shell_inputs.load_vector.value
+            if load_vector_value is None:
+                print("Direct generalized shell load-vector norm: deferred (non-inline graph)")
+            else:
+                print(
+                    "Direct generalized shell load-vector norm: {:.6e}".format(
+                        np.linalg.norm(load_vector_value)
+                    )
                 )
-            )
         if any(
             getattr(loads, name, None) is not None
             for name in ("nodal_forces", "nodal_pressure", "nodal_moments")
         ):
-            F_solid_func = Function(self.shell_pde.VF)
-            F_solid_func.x.array[:] = shell_inputs.F_solid.value
-            print(
-                "Total field load projected to solid: {}".format(
-                    [dolfinx.fem.assemble_scalar(dolfinx.fem.form(F_solid_func[i] * ufl.dx)) for i in range(3)]
+            field_load_value = shell_inputs.F_solid.value
+            if field_load_value is None:
+                print("Total field load projected to solid: deferred (non-inline graph)")
+            else:
+                F_solid_func = Function(self.shell_pde.VF)
+                F_solid_func.x.array[:] = field_load_value
+                print(
+                    "Total field load projected to solid: {}".format(
+                        [dolfinx.fem.assemble_scalar(dolfinx.fem.form(F_solid_func[i] * ufl.dx)) for i in range(3)]
+                    )
                 )
-            )
         print("=" * 40)
         print("Solving the RM shell model ...")
         raw_outputs = FEAModel(fea=[self.fea], fea_name="rm_shell").evaluate(shell_inputs, debug_mode=debug_mode)
@@ -1110,8 +1163,8 @@ class RMShellModel:
             material=material,
             loads=loads,
             node_disp=node_disp,
+            mesh_nodes=mesh_nodes,
             disp_solid=raw_outputs.disp_solid,
-            uhat=shell_inputs.uhat,
             raw_outputs=raw_outputs,
         )
 
@@ -1160,6 +1213,7 @@ class RMShellModel:
         nodal_moments = kwargs.pop("nodal_moments", None)
         load_vector = kwargs.pop("load_vector", None)
         node_disp = kwargs.pop("node_disp", None)
+        mesh_nodes = kwargs.pop("mesh_nodes", None)
         debug_mode = kwargs.pop("debug_mode", False)
         if kwargs:
             raise TypeError(f"Unexpected keyword arguments: {sorted(kwargs.keys())}")
@@ -1190,10 +1244,16 @@ class RMShellModel:
         if load_vector is not None:
             vector_loads = self.load_inputs.from_vector(load_vector=load_vector)
         loads = self.load_inputs.combine(field_loads, vector_loads)
-        state = self.solve(material=material, loads=loads, node_disp=node_disp, debug_mode=debug_mode)
+        state = self.solve(
+            material=material,
+            loads=loads,
+            node_disp=node_disp,
+            mesh_nodes=mesh_nodes,
+            debug_mode=debug_mode,
+        )
         return self.post.evaluate(state=state, debug_mode=debug_mode)
 
-    def assemble_generalized_load_vector(self, nodal_forces=None, nodal_pressure=None, nodal_moments=None, node_disp=None):
+    def assemble_generalized_load_vector(self, nodal_forces=None, nodal_pressure=None, nodal_moments=None, node_disp=None, mesh_nodes=None):
         shell_pde = self.shell_pde
         pressure_mesh_indices = self._pressure_indices(shell_pde)
         deformation_mesh_indices = self.mesh.geometry.input_global_indices
@@ -1210,18 +1270,21 @@ class RMShellModel:
         if nodal_moments is not None:
             m_values += np.asarray(nodal_moments)[pressure_mesh_indices].reshape(-1)
 
-        uhat_values = np.zeros(self.fea.inputs_dict["uhat"]["shape"])
-        if node_disp is not None:
-            uhat_values = np.asarray(node_disp)[deformation_mesh_indices].reshape(-1)
+        if node_disp is not None and mesh_nodes is not None:
+            raise ValueError("Provide either mesh_nodes or node_disp, not both.")
+        current_nodes = self.reference_mesh_nodes.copy()
+        if mesh_nodes is not None:
+            current_nodes[:] = np.asarray(mesh_nodes).reshape(current_nodes.shape)
+        elif node_disp is not None:
+            current_nodes += np.asarray(node_disp).reshape(current_nodes.shape)
+        self.mesh.geometry.x[:] = current_nodes[deformation_mesh_indices]
 
         f_func = Function(shell_pde.VF)
         m_func = Function(shell_pde.VF)
-        uhat_func = Function(shell_pde.VU)
         f_func.x.array[:] = f_values
         m_func.x.array[:] = m_values
-        uhat_func.x.array[:] = uhat_values
 
-        return shell_pde.assemble_generalized_load_vector(uhat=uhat_func, f=f_func, m=m_func)
+        return shell_pde.assemble_generalized_load_vector(f=f_func, m=m_func)
 
 
 class AggregatedStressModel:

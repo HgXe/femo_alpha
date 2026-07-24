@@ -4,10 +4,16 @@ from femo_alpha.fea.fea_dolfinx import (FEA, update, getFuncArray, computePartia
                                   assembleSystem, setUpKSP_MUMPS)
 import csdl_alpha as csdl
 import numpy as np
+import ufl
+from dolfinx.fem import Function
 
 
 def is_direct_vector_input(arg):
     return arg.get("type", "function") in ("vector", "direct_vector")
+
+
+def is_mesh_coordinates_input(arg):
+    return arg.get("type", "function") == "mesh_coordinates"
 
 
 class StateOperation(csdl.experimental.CustomImplicitOperation):
@@ -107,6 +113,9 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
         direct_residual_inputs = []
         for arg_name in input_vals:
             arg = self.args_dict[arg_name]
+            if is_mesh_coordinates_input(arg):
+                self._update_mesh_coordinates(arg_name, arg, input_vals[arg_name])
+                continue
             if is_direct_vector_input(arg):
                 direct_residual_inputs.append(
                     self._build_direct_residual_input(arg_name, input_vals[arg_name])
@@ -198,10 +207,21 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
                         d_residuals[state_name] += data.get('sign', -1.0) * contrib
                         continue
 
-                    update(data['fea_df'], d_inputs[arg_name])
-                    dRdf = data['dRdf']
+                    if data["kind"] == "mesh_coordinates":
+                        values = np.asarray(d_inputs[arg_name]).reshape(data["shape"])
+                        local_values = values[data["input_global_indices"]].reshape(-1)
+                        update(data["fea_df"], local_values)
+                        contrib = computeMatVecProductFwd(data["dRdf"], data["fea_df"])
+                        contrib = self._zero_constrained_entries(
+                            contrib, data.get("constrained_dofs")
+                        )
+                        d_residuals[state_name] += contrib
+                        continue
+
+                    update(data["fea_df"], d_inputs[arg_name])
+                    dRdf = data["dRdf"]
                     d_residuals[state_name] += computeMatVecProductFwd(
-                            dRdf, data['fea_df'])
+                            dRdf, data["fea_df"])
         # for mode = rev
         # d_residuals --> d_inputs
         elif mode == 'rev':
@@ -230,9 +250,21 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
                         )
                         continue
 
-                    dRdf = data['dRdf']
+                    dRdf = data["dRdf"]
                     d_input_contrib = computeMatVecProductBwd(
                         dRdf, self.fea_dR)
+                    if data["kind"] == "mesh_coordinates":
+                        local_values = d_input_contrib.reshape((-1, data["gdim"]))
+                        external_values = np.zeros(data["shape"], dtype=local_values.dtype)
+                        np.add.at(
+                            external_values,
+                            data["input_global_indices"],
+                            local_values,
+                        )
+                        d_inputs[arg_name] += external_values.reshape(
+                            d_inputs[arg_name].shape
+                        )
+                        continue
                     d_inputs[arg_name] += d_input_contrib.reshape(
                         d_inputs[arg_name].shape)
         else:
@@ -299,6 +331,24 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
         for arg_ind in range(len(arg_list)):
             arg_name = arg_list[arg_ind]
             arg = self.args_dict[arg_name]
+            if is_mesh_coordinates_input(arg):
+                coordinate_trial = ufl.TrialFunction(arg["function_space"])
+                dR_df = ufl.derivative(
+                    self.fea_state["residual_form"],
+                    arg["coordinate"],
+                    coordinate_trial,
+                )
+                constrained_dofs = self._get_default_constrained_dofs()
+                dR_df_dict[arg_name] = dict(
+                    kind="mesh_coordinates",
+                    dR_df=dR_df,
+                    fea_df=Function(arg["function_space"]),
+                    shape=arg["shape"],
+                    gdim=arg["mesh"].geometry.dim,
+                    input_global_indices=arg["input_global_indices"],
+                    constrained_dofs=constrained_dofs,
+                )
+                continue
             if is_direct_vector_input(arg):
                 constrained_dofs = arg.get('constrained_dofs')
                 if constrained_dofs is None:
@@ -347,9 +397,12 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
         # update the input values in the FEA model
         for arg_name in input_vals:
             arg = self.args_dict[arg_name]
+            if is_mesh_coordinates_input(arg):
+                self._update_mesh_coordinates(arg_name, arg, input_vals[arg_name])
+                continue
             if is_direct_vector_input(arg):
                 continue
-            update(arg['function'], input_vals[arg_name])
+            update(arg["function"], input_vals[arg_name])
         update(self.fea_state['function'], output_vals[self.state_name])
 
         dR_df_dict = self.dR_df_dict
@@ -369,6 +422,22 @@ class StateOperation(csdl.experimental.CustomImplicitOperation):
                         bcs=self.fea.bc)
 
         self.ksp = setUpKSP_MUMPS(self.A)
+
+    def _update_mesh_coordinates(self, arg_name, arg, values):
+        values = np.asarray(values)
+        if values.size != int(np.prod(arg["shape"])):
+            raise ValueError(
+                f"Mesh-coordinate input {arg_name!r} has size {values.size}, "
+                f"expected {int(np.prod(arg['shape']))}."
+            )
+        values = values.reshape(arg["shape"])
+        local_values = values[arg["input_global_indices"]]
+        if local_values.shape != arg["mesh"].geometry.x.shape:
+            raise ValueError(
+                f"Mesh-coordinate input {arg_name!r} maps to shape "
+                f"{local_values.shape}, expected {arg['mesh'].geometry.x.shape}."
+            )
+        arg["mesh"].geometry.x[:] = local_values
 
     def _get_default_constrained_dofs(self):
         if self._default_constrained_dofs is not None:

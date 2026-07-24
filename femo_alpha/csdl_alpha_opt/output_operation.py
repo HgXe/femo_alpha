@@ -10,6 +10,40 @@ from femo_alpha.fea.fea_dolfinx import (
 import csdl_alpha as csdl
 import numpy as np
 from ufl import TestFunction, TrialFunction, inner, dx
+import ufl
+from dolfinx.fem import Function
+
+
+def _is_mesh_coordinates(arg):
+    return arg.get("type", "function") == "mesh_coordinates"
+
+
+def _update_input(arg, values):
+    if not _is_mesh_coordinates(arg):
+        update(arg["function"], values)
+        return
+    values = np.asarray(values).reshape(arg["shape"])
+    local_values = values[arg["input_global_indices"]]
+    if local_values.shape != arg["mesh"].geometry.x.shape:
+        raise ValueError(
+            f"Mesh coordinates map to {local_values.shape}; "
+            f"expected {arg['mesh'].geometry.x.shape}."
+        )
+    arg["mesh"].geometry.x[:] = local_values
+
+
+def _coordinate_function(arg, external_values):
+    direction = Function(arg["function_space"])
+    values = np.asarray(external_values).reshape(arg["shape"])
+    update(direction, values[arg["input_global_indices"]].reshape(-1))
+    return direction
+
+
+def _external_coordinate_values(arg, local_values):
+    local_values = np.asarray(local_values).reshape((-1, arg["mesh"].geometry.dim))
+    external_values = np.zeros(arg["shape"], dtype=local_values.dtype)
+    np.add.at(external_values, arg["input_global_indices"], local_values)
+    return external_values
 
 
 class OutputOperation(csdl.CustomExplicitOperation):
@@ -60,19 +94,31 @@ class OutputOperation(csdl.CustomExplicitOperation):
     def compute(self, input_vals, output_vals):
         for arg_name in input_vals:
             arg = self.args_dict[arg_name]
-            update(arg["function"], input_vals[arg_name])
+            _update_input(arg, input_vals[arg_name])
 
         output_vals[self.output_name] = assemble(self.fea_output["form"])
 
     def compute_derivatives(self, input_vals, output_vals, derivatives):
         for arg_name in input_vals:
             arg = self.args_dict[arg_name]
-            update(arg["function"], input_vals[arg_name])
+            _update_input(arg, input_vals[arg_name])
 
         for arg_name in input_vals:
+            arg = self.args_dict[arg_name]
+            if _is_mesh_coordinates(arg):
+                coordinate_test = TestFunction(arg["function_space"])
+                coordinate_derivative = ufl.derivative(
+                    self.fea_output["form"],
+                    arg["coordinate"],
+                    coordinate_test,
+                )
+                local_gradient = assemble(coordinate_derivative, dim=1)
+                external_gradient = _external_coordinate_values(arg, local_gradient)
+                derivatives[self.output_name, arg_name] = external_gradient.reshape((1, -1))
+                continue
             derivatives[self.output_name, arg_name] = assemble(
                 computePartials(
-                    self.fea_output["form"], self.args_dict[arg_name]["function"]
+                    self.fea_output["form"], arg["function"]
                 ),
                 dim=self.output_dim + 1,
             )
@@ -109,6 +155,7 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
         # Lazily initialized projection operators used by jacobian-vector products.
         self._projection_rhs_form = None
         self._projection_mass_matrix = None
+        self._projection_mass_form = None
         self._projection_ksp = None
 
     def evaluate(self, inputs: csdl.VariableGroup):
@@ -130,7 +177,7 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
     def compute(self, input_vals, output_vals):
         for arg_name in input_vals:
             arg = self.args_dict[arg_name]
-            update(arg['function'], input_vals[arg_name])
+            _update_input(arg, input_vals[arg_name])
         self.fea.projectFieldOutput(self.fea_output['form'],self.fea_output['function'])
         output_vals[self.output_name] = getFuncArray(self.fea_output['function'])
 
@@ -142,9 +189,6 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
             )
 
     def _initialize_projection_operators(self):
-        if self._projection_mass_matrix is not None:
-            return
-
         output_space = self.fea_output['function'].function_space
         test_func = TestFunction(output_space)
         trial_func = TrialFunction(output_space)
@@ -152,14 +196,15 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
         # Projection equation: M * y = b where
         # b_i = int(inner(v(x), w_i) dx)
         self._projection_rhs_form = inner(self.fea_output['form'], test_func) * dx
-        mass_form = inner(trial_func, test_func) * dx
-        self._projection_mass_matrix = assembleMatrix(mass_form)
+        self._projection_mass_form = inner(trial_func, test_func) * dx
+        self._projection_mass_matrix = assembleMatrix(self._projection_mass_form)
         self._projection_ksp = setUpKSP_MUMPS(self._projection_mass_matrix)
 
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, mode):
         for arg_name in input_vals:
             arg = self.args_dict[arg_name]
-            update(arg['function'], input_vals[arg_name])
+            _update_input(arg, input_vals[arg_name])
+        update(self.fea_output["function"], output_vals[self.output_name])
 
         if self.output_name not in d_outputs:
             return
@@ -175,9 +220,31 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
                     d_arg = d_inputs[arg_name]
                     if d_arg is None:
                         continue
+                    arg = self.args_dict[arg_name]
+                    if _is_mesh_coordinates(arg):
+                        direction = _coordinate_function(arg, d_arg)
+                        d_rhs_form = ufl.derivative(
+                            self._projection_rhs_form,
+                            arg["coordinate"],
+                            direction,
+                        )
+                        rhs.array[:] += assemble(d_rhs_form, dim=1)
+                        d_mass_form = ufl.derivative(
+                            self._projection_mass_form,
+                            arg["coordinate"],
+                            direction,
+                        )
+                        d_mass_matrix = assembleMatrix(d_mass_form)
+                        current_output_vec = d_mass_matrix.createVecRight()
+                        current_output_vec.array[:] = output_vals[self.output_name].reshape(-1)
+                        current_output_vec.assemble()
+                        mass_contrib = d_mass_matrix.createVecLeft()
+                        d_mass_matrix.mult(current_output_vec, mass_contrib)
+                        rhs.array[:] -= mass_contrib.getArray()
+                        continue
                     d_rhs_form = computePartials(
                         self._projection_rhs_form,
-                        self.args_dict[arg_name]['function'],
+                        arg['function'],
                     )
                     d_rhs_mat = assembleMatrix(d_rhs_form)
 
@@ -206,6 +273,33 @@ class OutputFieldOperation(csdl.CustomExplicitOperation):
 
             for arg_name in self.args_dict:
                 if arg_name in d_inputs:
+                    arg = self.args_dict[arg_name]
+                    if _is_mesh_coordinates(arg):
+                        coordinate_trial = TrialFunction(arg["function_space"])
+                        d_rhs_form = ufl.derivative(
+                            self._projection_rhs_form,
+                            arg["coordinate"],
+                            coordinate_trial,
+                        )
+                        d_rhs_matrix = assembleMatrix(d_rhs_form)
+                        mass_action = ufl.action(
+                            self._projection_mass_form,
+                            self.fea_output["function"],
+                        )
+                        d_mass_action = ufl.derivative(
+                            mass_action,
+                            arg["coordinate"],
+                            coordinate_trial,
+                        )
+                        d_mass_matrix = assembleMatrix(d_mass_action)
+                        local_contrib = d_rhs_matrix.createVecRight()
+                        d_rhs_matrix.multTranspose(adjoint_rhs, local_contrib)
+                        mass_contrib = d_mass_matrix.createVecRight()
+                        d_mass_matrix.multTranspose(adjoint_rhs, mass_contrib)
+                        local_contrib.array[:] -= mass_contrib.getArray()
+                        external = _external_coordinate_values(arg, local_contrib.getArray())
+                        d_inputs[arg_name] += external
+                        continue
                     d_rhs_form = computePartials(
                         self._projection_rhs_form,
                         self.args_dict[arg_name]['function'],

@@ -15,7 +15,6 @@ from femo_alpha.rm_shell.linear_shell_fenicsx.linear_shell_model import (ShellEl
                                                                     MaterialModel,
                                                                     ElasticModelShapeOpt)
 from femo_alpha.rm_shell.linear_shell_fenicsx.utils import computeNodalDisp
-from femo_alpha.rm_shell.linear_shell_fenicsx.kinematics import J
 
 
 class RMShellPDE:
@@ -42,15 +41,14 @@ class RMShellPDE:
             self.VF = VectorFunctionSpace(mesh, ("DG", 0))
         else:
             self.VF = VectorFunctionSpace(mesh, ("CG", 1))
-        self.VU = VectorFunctionSpace(mesh, ("CG", 1))
         self.bf_sup_sizes = assemble_vector(
                 form(TestFunction(self.VF.sub(0).collapse()[0])*dx)).getArray()
         # self.bf_sup_sizes = np.ones_like(self.bf_sup_sizes)
 
-    def pdeRes(self, h, w, uhat, f, m, E, nu, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
+    def pdeRes(self, h, w, f, m, E, nu, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
         material_model = MaterialModel(E=E,nu=nu,h=h)
         self.elastic_model = elastic_model = ElasticModelShapeOpt(self.mesh,
-                                                w, uhat, material_model.CLT)
+                                                w, material_model.CLT)
         elastic_energy = elastic_model.elasticEnergy(E, h,
                                     self.dx_inplane,self.dx_shear)
         res = elastic_model.weakFormResidual(elastic_energy, f=f, m=m,
@@ -58,18 +56,18 @@ class RMShellPDE:
         return res
         # # Inertia relief
         # f_d = ufl.as_vector([0.,0.,-rho*h*g])
-        # res -= inner(f_d,elastic_model.du_mid)*J(uhat)*dx
+        # res -= inner(f_d,elastic_model.du_mid)*dx
         # return res
 
-    def assemble_generalized_load_vector(self, uhat, f=None, m=None):
+    def assemble_generalized_load_vector(self, f=None, m=None):
         dw = TestFunction(self.W)
         du_mid, dtheta = ufl.split(dw)
 
         load_form = 0
         if f is not None:
-            load_form += inner(f, du_mid) * J(uhat) * dx
+            load_form += inner(f, du_mid) * dx
         if m is not None:
-            load_form += inner(m, dtheta) * J(uhat) * dx
+            load_form += inner(m, dtheta) * dx
         if f is None and m is None:
             raise ValueError("At least one of f or m must be provided.")
 
@@ -96,28 +94,28 @@ class RMShellPDE:
         # No regularization
         return regularization
 
-    def compliance(self, u_mid, theta, uhat, h, f, m):
-        compliance = inner(u_mid, f) * J(uhat) * ufl.dx
-        compliance += inner(theta, m) * J(uhat) * ufl.dx
+    def compliance(self, u_mid, theta, h, f, m):
+        compliance = inner(u_mid, f) * ufl.dx
+        compliance += inner(theta, m) * ufl.dx
         return compliance
     
-    def tip_disp(self,u_mid,uhat,dxx):
-        return Constant(self.mesh, 0.5)*inner(u_mid,u_mid)*J(uhat)*dxx
+    def tip_disp(self,u_mid,dxx):
+        return Constant(self.mesh, 0.5)*inner(u_mid,u_mid)*dxx
     
-    def volume(self,uhat,h):
-        return h*J(uhat)*dx
+    def volume(self,h):
+        return h*dx
 
-    def mass(self,uhat,h,rho):
-        return rho*h*J(uhat)*dx
+    def mass(self,h,rho):
+        return rho*h*dx
     
-    def cg_form(self, uhat, h, rho):
+    def cg_form(self, h, rho):
         """
         Compute the center of gravity forms.
         Returns forms for CG_x, CG_y, CG_z numerators and total mass.
         CG = sum(position * mass) / sum(mass)
         """
-        x = ufl.SpatialCoordinate(self.mesh)
-        mass_element = rho * h * J(uhat)
+        x = self.mesh._femo_spatial_coordinate
+        mass_element = rho * h
         
         cg_x_numerator = x[0] * mass_element * dx
         cg_y_numerator = x[1] * mass_element * dx
@@ -126,40 +124,40 @@ class RMShellPDE:
         
         return cg_x_numerator, cg_y_numerator, cg_z_numerator, total_mass
     
-    def area_subdomain(self,uhat,dxx):
-        return J(uhat)*dxx
+    def area_subdomain(self,dxx):
+        return Constant(self.mesh, 1.0) * dxx
     
-    def elastic_energy(self,w,uhat,h,E):
+    def elastic_energy(self,w,h,E):
         elastic_energy = self.elastic_model.elasticEnergy(E, h, 
                                         self.dx_inplane, self.dx_shear)
         return elastic_energy
 
-    def pnorm_stress(self,w,uhat,h,E,nu,dx,m=1e-6,rho=100,alpha=None,regularization=False):
+    def pnorm_stress(self,w,h,E,nu,dx,m=1e-6,rho=100,alpha=None,regularization=False):
         """
         Compute the p-norm of the stress
         `rho` is the Constraint aggregation factor
         """
-        shell_stress_RM = ShellStressRM(self.mesh, w, uhat, h, E, nu)
+        shell_stress_RM = ShellStressRM(self.mesh, w, h, E, nu)
         # stress on the top surface
         vm_stress = shell_stress_RM.vonMisesStress(h/2)
-        pnorm = (m*vm_stress)**rho*J(uhat)*dx
+        pnorm = (m*vm_stress)**rho*dx
         if regularization:
-            regularization = 0.5*Constant(self.mesh, 1e3)*h**rho*J(uhat)*dx
+            regularization = 0.5*Constant(self.mesh, 1e3)*h**rho*dx
             pnorm += regularization
         if alpha == None:
             ##### alpha is a parameter based on the surface area
-            alpha_form = Constant(self.mesh,1.0)*J(uhat)*dx
+            alpha_form = Constant(self.mesh,1.0)*dx
             alpha = assemble_scalar(form(alpha_form))
         return 1/alpha*pnorm
     
-    def sum_stress_subdomain(self,w,uhat,h,E,nu,dxx):
+    def sum_stress_subdomain(self,w,h,E,nu,dxx):
         """
         Computes the average stress in global coordiantes over a subdomain
         """
-        shell_stress_RM = ShellStressRM(self.mesh, w, uhat, h, E, nu)
+        shell_stress_RM = ShellStressRM(self.mesh, w, h, E, nu)
         # stress on the top surface
         # vm_stress = shell_stress_RM.vonMisesStress(h/2)
-        # sum_subdomain = vm_stress*J(uhat)*dxx
+        # sum_subdomain = vm_stress*dxx
         sigma = shell_stress_RM.inplaneStress(h/2)
         sigma_x = sigma[0,0]
         sigma_y = sigma[1,1]
@@ -167,16 +165,16 @@ class RMShellPDE:
         sigma_xy = sigma[0,1]
         sigma_xz = sigma[0,2]
         sigma_yz = sigma[1,2]
-        sum_x = sigma_x*J(uhat)*dxx
-        sum_y = sigma_y*J(uhat)*dxx
-        sum_z = sigma_z*J(uhat)*dxx
-        sum_xy = sigma_xy*J(uhat)*dxx
-        sum_xz = sigma_xz*J(uhat)*dxx
-        sum_yz = sigma_yz*J(uhat)*dxx
+        sum_x = sigma_x*dxx
+        sum_y = sigma_y*dxx
+        sum_z = sigma_z*dxx
+        sum_xy = sigma_xy*dxx
+        sum_xz = sigma_xz*dxx
+        sum_yz = sigma_yz*dxx
         return sum_x, sum_y, sum_z, sum_xy, sum_xz, sum_yz
 
-    def von_Mises_stress(self,w,uhat,h,E,nu,surface='Top'):
-        shell_stress_RM = ShellStressRM(self.mesh, w, uhat, h, E, nu)
+    def von_Mises_stress(self,w,h,E,nu,surface='Top'):
+        shell_stress_RM = ShellStressRM(self.mesh, w, h, E, nu)
         if surface == 'Top':
             # stress on the top surface
             vm_stress = shell_stress_RM.vonMisesStress(h/2)

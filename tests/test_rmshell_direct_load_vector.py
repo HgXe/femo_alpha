@@ -44,7 +44,7 @@ def _build_surface_mesh(nx=4, ny=2):
         return xdmf.read_mesh(name="Grid")
 
 
-def _build_shell_model(recorder_path, nx=4, ny=2, record=True):
+def _build_shell_model(recorder_path, nx=4, ny=2, record=True, geometry_input_mode="coordinates"):
     mesh = _build_surface_mesh(nx=nx, ny=ny)
     return RMShellModel(
         mesh,
@@ -53,6 +53,7 @@ def _build_shell_model(recorder_path, nx=4, ny=2, record=True):
         record=record,
         solve_direct=True,
         recorder_path=recorder_path,
+        geometry_input_mode=geometry_input_mode,
     )
 
 
@@ -103,12 +104,9 @@ def _fenics_ordered_inputs_with_moments(shell_model):
 def _assemble_load_direction(shell_model, field_direction):
     f_func = Function(shell_model.shell_pde.VF)
     m_func = Function(shell_model.shell_pde.VF)
-    uhat_func = Function(shell_model.shell_pde.VU)
     f_func.x.array[:] = field_direction
     m_func.x.array[:] = 0.0
-    uhat_func.x.array[:] = 0.0
     return shell_model.shell_pde.assemble_generalized_load_vector(
-        uhat=uhat_func,
         f=f_func,
         m=m_func,
     )
@@ -117,12 +115,9 @@ def _assemble_load_direction(shell_model, field_direction):
 def _assemble_combined_load_direction(shell_model, force_direction, moment_direction):
     f_func = Function(shell_model.shell_pde.VF)
     m_func = Function(shell_model.shell_pde.VF)
-    uhat_func = Function(shell_model.shell_pde.VU)
     f_func.x.array[:] = force_direction
     m_func.x.array[:] = moment_direction
-    uhat_func.x.array[:] = 0.0
     return shell_model.shell_pde.assemble_generalized_load_vector(
-        uhat=uhat_func,
         f=f_func,
         m=m_func,
     )
@@ -436,6 +431,13 @@ def test_rmshell_compliance_matches_generalized_load_work():
         atol=1e-10,
     )
 
+    np.testing.assert_allclose(
+        2.0 * outputs.elastic_energy.value,
+        outputs.compliance.value,
+        rtol=1e-8,
+        atol=1e-8,
+    )
+
     recorder.stop()
 
 
@@ -633,5 +635,104 @@ def test_rmshell_post_registry_supports_groups_and_custom_outputs():
         rtol=1e-10,
         atol=1e-10,
     )
+
+    recorder.stop()
+
+
+def test_rmshell_accepts_direct_mesh_coordinates_and_differentiates_them():
+    shell_model = _build_shell_model(
+        str(RECORDS_ROOT / "rmshell_direct_mesh_coordinates"),
+        nx=2,
+        ny=1,
+        record=False,
+        geometry_input_mode="coordinates",
+    )
+    vals = _fenics_ordered_inputs(shell_model)
+
+    recorder = csdl.Recorder(inline=True)
+    recorder.start()
+
+    material = _build_isotropic_material(shell_model, vals, "direct_coordinates")
+    loads = _build_vector_loads(shell_model, vals, "direct_coordinates")
+    mesh_nodes = csdl.Variable(
+        value=shell_model.reference_mesh_nodes.copy(),
+        name="direct_mesh_coordinates",
+    )
+    state = shell_model.solve(
+        material,
+        loads,
+        mesh_nodes=mesh_nodes,
+    )
+    outputs = shell_model.post.evaluate(state=state)
+
+    assert state.mesh_nodes is mesh_nodes
+    assert state.node_disp is None
+    np.testing.assert_allclose(state.raw_outputs.disp_solid.value, outputs.disp_solid.value)
+
+    derivative = csdl.derivative(outputs.compliance, [mesh_nodes])[mesh_nodes]
+    assert derivative.shape == (1, int(np.prod(mesh_nodes.shape)))
+    assert np.all(np.isfinite(derivative.value))
+    assert np.linalg.norm(derivative.value) > 0.0
+
+    recorder.stop()
+
+
+def test_rmshell_mesh_coordinate_state_and_post_derivatives_match_finite_difference():
+    shell_model = _build_shell_model(
+        str(RECORDS_ROOT / "rmshell_mesh_coordinate_fd"),
+        nx=2,
+        ny=1,
+        record=False,
+    )
+    vals = _fenics_ordered_inputs(shell_model)
+
+    recorder = csdl.Recorder(inline=True)
+    recorder.start()
+
+    material = _build_isotropic_material(shell_model, vals, "coordinate_fd")
+    loads = _build_vector_loads(shell_model, vals, "coordinate_fd")
+
+    reference = shell_model.reference_mesh_nodes.copy()
+    direction = np.zeros_like(reference)
+    direction[:, 0] = 0.03 * reference[:, 0] / np.max(reference[:, 0])
+    direction[:, 1] = 0.02 * reference[:, 1] / np.max(reference[:, 1])
+    direction[:, 2] = (
+        0.01
+        * reference[:, 0]
+        / np.max(reference[:, 0])
+        * (reference[:, 1] - np.mean(reference[:, 1]))
+    )
+    geometry_control = csdl.Variable(value=np.array([0.0]), name="geometry_control")
+    mesh_nodes = (
+        csdl.Variable(value=reference, name="reference_mesh_nodes")
+        + geometry_control * csdl.Variable(value=direction, name="mesh_direction")
+    )
+
+    state = shell_model.solve(material, loads, mesh_nodes=mesh_nodes)
+    shell_model.post.compliance().mass().cg().elastic_energy().mid_strain().shear_strain().curvature()
+    outputs = shell_model.post.compute(state=state)
+
+    checked_outputs = [
+        outputs.compliance,
+        outputs.mass,
+        outputs.cg[0],
+        outputs.cg[1],
+        outputs.elastic_energy,
+        csdl.sum(outputs.mid_strain),
+        csdl.sum(outputs.shear_strain),
+        csdl.sum(outputs.curvature),
+    ]
+    sim = csdl.experimental.PySimulator(recorder)
+    totals = sim.check_totals(
+        checked_outputs,
+        [geometry_control],
+        step_size=2e-6,
+        print_results=False,
+        raise_on_error=True,
+    )
+
+    for result in totals.values():
+        assert np.all(np.isfinite(result["value"]))
+        assert np.all(np.isfinite(result["fd_value"]))
 
     recorder.stop()
