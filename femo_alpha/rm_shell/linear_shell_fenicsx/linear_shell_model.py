@@ -326,7 +326,7 @@ class ElasticModelShapeOpt(object):
     #     return retval
 
     def weakFormResidual(self, elasticEnergy, f=None, m=None,
-                    penalty=False, g=None, dss=None, dSS=None):
+                    penalty=False, g=None, dss=None, dSS=None, bc_dof_mask=None):
 
         dw = TestFunction(self.W)
         self.du_mid, self.dtheta = split(dw)
@@ -334,7 +334,7 @@ class ElasticModelShapeOpt(object):
         retval = derivative(elasticEnergy, self.w, dw)
 
         if penalty:
-            retval += self.penaltyResidual(self.w, dw, g, dss, dSS)
+            retval += self.penaltyResidual(self.w, dw, g, dss, dSS, bc_dof_mask)
 
         if f is not None:
             retval -= inner(f, self.du_mid) * dx
@@ -347,12 +347,23 @@ class ElasticModelShapeOpt(object):
 
         return retval
 
-    def penaltyResidual(self,u,v,g,dss,dSS):
+    def penaltyResidual(self, u, v, g, dss, dSS, bc_dof_mask=None):
         beta = Constant(self.mesh, 1E15)
         h_E = CellDiameter(self.mesh)
-        return beta/h_E*inner(u-g, v)*dss + \
-               (beta/h_E*inner(u-g, v))('+')*dSS + \
-               (beta/h_E*inner(u-g, v))('-')*dSS
+        if bc_dof_mask is None:
+            integrand = beta/h_E*inner(u-g, v)
+        else:
+            u_mid, theta = split(u)
+            v_mid, v_theta = split(v)
+            g_mid, g_theta = split(g)
+            mask_mid, mask_theta = bc_dof_mask[:3], bc_dof_mask[3:]
+            masked_diff = as_vector(
+                [mask_mid[i]*(u_mid[i] - g_mid[i]) for i in range(3)]
+                + [mask_theta[i]*(theta[i] - g_theta[i]) for i in range(3)]
+            )
+            v_full = as_vector([v_mid[i] for i in range(3)] + [v_theta[i] for i in range(3)])
+            integrand = beta/h_E*inner(masked_diff, v_full)
+        return integrand*dss + integrand('+')*dSS + integrand('-')*dSS
 
     def inertialResidual(self, rho, h):
         '''

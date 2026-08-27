@@ -684,6 +684,7 @@ class ShellPostProcessor:
             form_fn,
             ["thickness", "disp_solid", "E", "nu", "mesh_nodes"],
             ("DG", 1),
+            reorder="element_dofs",
             record=self.shell_model.record,
         )
 
@@ -745,6 +746,15 @@ class ShellPostProcessor:
                 value = context.shell_model._reorder_nodes(value.reshape((-1, 3)))
             elif reorder == "rotation":
                 value = context.shell_model._reorder_nodes(value.reshape((-1, 3)))
+            elif reorder == "element_dofs":
+                # generic per-cell reorder for scalar fields with an
+                # arbitrary (but uniform) number of DOFs per cell, e.g. a
+                # DG1 field on quads (4 dofs/cell) -- unlike mid_strain/
+                # curvature/etc., these fields have no fixed known trailing
+                # shape, so infer dofs-per-cell from the array size instead
+                # of hardcoding a reshape target
+                num_elements = context.shell_model.mesh.topology.original_cell_index.shape[0]
+                value = context.shell_model._reorder_elements(value.reshape((num_elements, -1)))
             result[name] = value
         return result
 
@@ -766,11 +776,30 @@ class RMShellModel:
         strain_heights=None,
         element="CG2CG1",
         geometry_input_mode="coordinates",
+        bc_dof_mask=None,
+        gauge_points=None,
     ):
+        """
+        ``bc_dof_mask``: optional 6-entry sequence (u_x, u_y, u_z, theta_x,
+        theta_y, theta_z) selecting which DOF components ``shell_bc_func``'s
+        region penalizes to zero. Defaults to ``None``, i.e. all six (today's
+        full clamp) -- pass e.g. ``(0, 1, 0, 1, 0, 1)`` for a symmetry-plane
+        condition normal to y that leaves u_x, u_z, theta_y free.
+
+        ``gauge_points``: optional list of ``(point_predicate, components)``
+        pairs, each adding strong Dirichlet BCs (independent of
+        ``PENALTY_BC``) pinning the listed DOF components (same 0-5 indexing
+        as ``bc_dof_mask``) at the single node ``point_predicate`` locates.
+        Used to remove residual rigid-body modes left over after a symmetry
+        ``bc_dof_mask`` (e.g. a statically-determinate nose/tail support),
+        not to enforce a real physical boundary condition.
+        """
         self.mesh = mesh
         self.mesh_tags = mesh_tags
         self.additional_outputs = additional_outputs
         self.shell_bc_func = shell_bc_func
+        self.bc_dof_mask = tuple(bc_dof_mask) if bc_dof_mask is not None else None
+        self.gauge_points = list(gauge_points) if gauge_points else []
         self.element_wise_material = element_wise_material
         self.record = record
         self.recorder_path = recorder_path
@@ -913,22 +942,55 @@ class RMShellModel:
         fea.linear_problem = True
 
     def _add_strong_bcs(self, fea, shell_pde):
-        if self.PENALTY_BC:
-            return
         W = shell_pde.W
-        locate_BC1 = dolfinx.fem.locate_dofs_geometrical(
-            (W.sub(0), W.sub(0).collapse()[0]), self.shell_bc_func
-        )
-        locate_BC2 = dolfinx.fem.locate_dofs_geometrical(
-            (W.sub(1), W.sub(1).collapse()[0]), self.shell_bc_func
-        )
-        ubc = Function(W)
-        with ubc.vector.localForm() as uloc:
-            uloc.set(0.0)
-        fea.bc = [
-            dolfinx.fem.dirichletbc(ubc, locate_BC1, W.sub(0)),
-            dolfinx.fem.dirichletbc(ubc, locate_BC2, W.sub(1)),
+        bcs = []
+        if not self.PENALTY_BC:
+            locate_BC1 = dolfinx.fem.locate_dofs_geometrical(
+                (W.sub(0), W.sub(0).collapse()[0]), self.shell_bc_func
+            )
+            locate_BC2 = dolfinx.fem.locate_dofs_geometrical(
+                (W.sub(1), W.sub(1).collapse()[0]), self.shell_bc_func
+            )
+            ubc = Function(W)
+            with ubc.vector.localForm() as uloc:
+                uloc.set(0.0)
+            bcs.append(dolfinx.fem.dirichletbc(ubc, locate_BC1, W.sub(0)))
+            bcs.append(dolfinx.fem.dirichletbc(ubc, locate_BC2, W.sub(1)))
+        bcs.extend(self._build_gauge_point_bcs(shell_pde))
+        fea.bc = bcs
+
+    def _build_gauge_point_bcs(self, shell_pde):
+        """Strong point Dirichlet BCs pinning residual rigid-body modes.
+
+        Independent of ``PENALTY_BC``: these target single mesh nodes, which
+        the facet-integral penalty mechanism (built for boundary regions,
+        where an entity is only selected if *all* its vertices match the
+        predicate) cannot reliably pin.
+        """
+        if not self.gauge_points:
+            return []
+        W = shell_pde.W
+        subspaces = [
+            W.sub(0).sub(0), W.sub(0).sub(1), W.sub(0).sub(2),
+            W.sub(1).sub(0), W.sub(1).sub(1), W.sub(1).sub(2),
         ]
+        zero = Function(W)
+        with zero.vector.localForm() as uloc:
+            uloc.set(0.0)
+        bcs = []
+        for point_predicate, components in self.gauge_points:
+            for component in components:
+                sub = subspaces[component]
+                dofs = dolfinx.fem.locate_dofs_geometrical(
+                    (sub, sub.collapse()[0]), point_predicate
+                )
+                if dofs[0].size == 0:
+                    raise ValueError(
+                        "Gauge-point predicate matched no DOFs for component "
+                        f"{component}; check the target coordinate and tolerance."
+                    )
+                bcs.append(dolfinx.fem.dirichletbc(zero, dofs, sub))
+        return bcs
 
     def _build_analysis_objects(self):
         shell_pde = CompositeShellPDE(
@@ -969,6 +1031,7 @@ class RMShellModel:
             dss=self.dss,
             dSS=self.dSS,
             g=g,
+            bc_dof_mask=self.bc_dof_mask,
         )
 
         solve_fea.add_input("thickness", h, init_val=0.001, record=self.record)

@@ -56,14 +56,15 @@ class RMShellPDE:
             self.mesh, w, material_model.CLT)
         return elastic_model
 
-    def pdeRes(self, w, f, m, A, B, D, As, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None):
+    def pdeRes(self, w, f, m, A, B, D, As, penalty=False, dss=ufl.ds, dSS=ufl.dS, g=None, bc_dof_mask=None):
         elastic_model = self.set_elastic_model(w, A, B, D, As)
         elastic_energy = elastic_model.elasticEnergy(
                             dx_inplane=self.dx_inplane,
                             dx_shear=self.dx_shear
                             )
         res = elastic_model.weakFormResidual(elastic_energy, f=f, m=m,
-                                            penalty=penalty, dss=dss, dSS=dSS, g=g)
+                                            penalty=penalty, dss=dss, dSS=dSS, g=g,
+                                            bc_dof_mask=bc_dof_mask)
         return res
         # # Inertia relief
         # f_d = ufl.as_vector([0.,0.,-rho*h*g])
